@@ -5,6 +5,7 @@
 #include "Tree.h"
 #include "Sparrow.h"
 #include "SVGExport.h"
+#include <iomanip>
 
 int main() {
     // 1. Tạo dữ liệu (15 cây thông)
@@ -30,6 +31,9 @@ int main() {
     // 3. Chạy Solver
     SparrowSolver solver(items, config);
     solver.solve(); // Chạy toàn bộ quy trình Algo 10->13
+    double side = solver.getContainerSize();
+    double score = side * side / items.size();
+    std::cout << ">>> Final Score: " << std::setprecision(10) << std::fixed << score << std::endl;
     exportToSVG("../output/ket_qua_sparrow.svg", solver, 40.0);
 
     // 4. Kết quả nằm trong solver.items và solver.getContainerSize()
