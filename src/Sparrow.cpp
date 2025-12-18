@@ -366,36 +366,61 @@ void SparrowSolver::perform_move_items(std::vector<CompositeShape>& local_items,
 }
 
 void SparrowSolver::move_items_multi() {
+    // Biến chia sẻ (Shared) để lưu kết quả tốt nhất
     double best_e = std::numeric_limits<double>::max();
-    // Khởi tạo best là hiện tại để fallback
-    std::vector<CompositeShape> best_items = items;
-    std::vector<std::vector<double>> best_weights = weights;
+    
+    // Lưu ý: Không khởi tạo best_items ở đây để tránh copy không cần thiết nếu không tìm thấy cái mới
+    // Ta dùng cờ hoặc mutex để update sau.
+    // Tuy nhiên, logic cũ dùng critical section là an toàn.
+    
+    // Biến tạm để lưu kết quả tốt nhất tìm được trong lần chạy này (để hạn chế critical section)
+    std::vector<CompositeShape> current_best_items;
+    std::vector<std::vector<double>> current_best_weights;
+    bool found_improvement = false;
 
-    // Chạy song song nhiều worker trên cùng 1 state
     #pragma omp parallel 
     {
-        std::vector<CompositeShape> local_items = items;
-        std::vector<std::vector<double>> local_weights = weights;
+        // --- TỐI ƯU HÓA BỘ NHỚ ---
+        // Sử dụng static thread_local để biến này "sống" mãi theo từng luồng.
+        // Nó chỉ được cấp phát 1 lần duy nhất khi luồng khởi tạo, và được dùng lại mãi mãi.
+        static thread_local std::vector<CompositeShape> local_items;
+        static thread_local std::vector<std::vector<double>> local_weights;
 
-        // Thực hiện move
+        // Gán dữ liệu mới vào vùng nhớ cũ (Reuse capacity)
+        // std::vector::operator= sẽ tái sử dụng vùng nhớ đã cấp phát nếu đủ chỗ.
+        // Điều này biến chi phí từ "malloc + copy" thành chỉ còn "copy" (nhanh hơn rất nhiều).
+        local_items = items; 
+        local_weights = weights;
+
+        // --- LOGIC XỬ LÝ ---
         perform_move_items(local_items, local_weights);
-        // Cập nhật weights cục bộ
         updateWeights(local_weights);
 
         double local_e = calculate_energy(local_items);
         
-        #pragma omp critical
-        {
-            if (local_e < best_e) {
-                best_e = local_e;
-                best_items = local_items;
-                best_weights = local_weights;
+        // --- GOM KẾT QUẢ ---
+        // Kiểm tra nhanh trước khi vào critical section để tránh nghẽn cổ chai
+        if (local_e < best_e) {
+            #pragma omp critical
+            {
+                // Kiểm tra lại lần nữa trong vùng an toàn (Double-checked locking pattern)
+                if (local_e < best_e) {
+                    best_e = local_e;
+                    // Copy ra ngoài vùng shared
+                    // Lưu ý: Việc copy này ít xảy ra hơn nhiều so với việc tính toán
+                    current_best_items = local_items;
+                    current_best_weights = local_weights;
+                    found_improvement = true;
+                }
             }
         }
     }
 
-    items = best_items;
-    weights = best_weights;
+    // Chỉ cập nhật vào items chính nếu tìm thấy cải thiện
+    if (found_improvement) {
+        items = current_best_items;
+        weights = current_best_weights;
+    }
 }
 
 bool SparrowSolver::separate(int kmax, int nmax, double time_limit_sec) {

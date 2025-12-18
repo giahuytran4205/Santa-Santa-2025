@@ -17,7 +17,7 @@ int main() {
     config.container_size = 1.2; // Kích thước khởi tạo (nên đủ lớn)
     config.max_iter = 1000;       // Iteration cho hàm separate (Inner loop)
     config.n_samples = 2048;
-    config.n_threads = 8;
+    config.n_threads = -1;
     config.Nc = 20;         // Reduce inner iters
     config.Nx = 10;
     config.Kc = 3;
