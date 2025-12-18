@@ -668,7 +668,7 @@ void SparrowSolver::solve() {
     double bestSize = config.container_size;
     std::vector<CompositeShape> bestItems = items;
     
-    int maxRestarts = 10;
+    int maxRestarts = config.max_restart;
     for (int iter = 0; iter < maxRestarts; ++iter) {
         std::cout << "\n=== Major Iteration " << iter << " ===" << std::endl;
         

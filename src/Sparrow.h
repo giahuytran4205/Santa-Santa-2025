@@ -27,6 +27,7 @@ struct SparrowConfig {
     double Ml = 1.05;      // Multiplier low (GLS)
     double Mu = 1.1;       // Multiplier up (GLS)
     int max_outer_loops = 20;
+    int max_restart = 10;
 };
 
 class SparrowSolver {
