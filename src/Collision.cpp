@@ -47,7 +47,7 @@ double quantify_collision(const CompositeShape& shapeA, const CompositeShape& sh
 
     // QUAN TRỌNG: Giảm epsilon xuống cực nhỏ để các vật có thể xếp khít
     // 1e-5 thay vì 0.01 (1%)
-    double R_epsilon = 1e-8; 
+    double R_epsilon = 0.01; 
     double epsilon = R_epsilon * std::max(shapeA.diameter, shapeB.diameter);
     
     // Ngưỡng cắt bỏ: Nếu tách xa quá ngưỡng này thì coi như không va chạm (Energy = 0)

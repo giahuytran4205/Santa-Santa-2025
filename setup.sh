@@ -1,6 +1,7 @@
 #!/bin/bash
 
-apt install build-essential
+apt install build-essential -y
+apt install cmake -y
 
 mkdir build
 
