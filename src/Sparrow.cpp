@@ -186,18 +186,24 @@ void SparrowSolver::searchPosition(int itemIdx, std::vector<CompositeShape>& loc
 
     // 3. FLIP SAMPLES (Quan trọng nhất cho đối xứng trục) - 20%
     // Thử lật ngược vật thể tại vị trí hiện tại (hoặc lân cận)
-    int n_flip = config.n_samples - n_div - n_foc;
-    for (int s = 0; s < n_flip; ++s) {
-        double dx = randomDouble(-foc_radius*0.5, foc_radius*0.5);
-        double dy = randomDouble(-foc_radius*0.5, foc_radius*0.5);
-        double x = current.pos.x + dx;
-        double y = current.pos.y + dy;
+    // THÊM: Smart Flip Samples (Ưu tiên cực cao cho bài toán cây thông)
+    // Thay vì random vị trí mới rồi xoay, hãy thử xoay ngay tại chỗ hoặc lân cận
+    int n_smart_flip = 16; 
+    for (int s = 0; s < n_smart_flip; ++s) {
+        double dx = randomDouble(-foc_radius * 0.2, foc_radius * 0.2);
+        double dy = randomDouble(-foc_radius * 0.2, foc_radius * 0.2);
+        
+        // Thử ép góc về 2 hướng chính: 0 (Up) và PI (Down)
+        double tryAngles[] = {0.0, PI, current.angle + PI};
+        
+        for (double ang : tryAngles) {
+            // Chuẩn hóa góc về [0, 2PI]
+             while (ang > 2*PI) ang -= 2*PI;
+             while (ang < 0) ang += 2*PI;
 
-        // LẬT 180 độ so với góc hiện tại
-        double rot = current.angle + PI + randomDouble(-0.1, 0.1); 
-
-        double e = evaluateSample(itemIdx, {x, y}, rot, local_items, local_weights);
-        samples.emplace_back(e, Transform({x, y}, rot));
+            double e = evaluateSample(itemIdx, current.pos + Vec2{dx, dy}, ang, local_items, local_weights);
+            samples.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, ang));
+        }
     }
 
     // Sort chọn cái tốt nhất
