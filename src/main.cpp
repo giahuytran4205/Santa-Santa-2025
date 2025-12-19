@@ -12,7 +12,7 @@
 int main(int argc, char **argv) {
     CLI::App app{"Sparrow Packing Solver"};
 
-    std::string configFilePath = "config.txt";
+    std::string configFilePath = "../config.txt";
     std::string outputFilePath = "../output/solution.svg";
     int num_tree = 3;
 

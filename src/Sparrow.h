@@ -81,6 +81,8 @@ struct SparrowConfig {
                 else if (key == "Rx") Rx = std::stod(value);
                 else if (key == "Rs_c") Rs_c = std::stod(value);
                 else if (key == "Re_c") Re_c = std::stod(value);
+                else if (key == "max_outer_loops") max_outer_loops = std::stoi(value);
+                else if (key == "max_restart") max_restart = std::stoi(value);
             } catch (const std::exception& e) {
                 std::cerr << "Error parsing key: " << key << " value: " << value << std::endl;
             }
