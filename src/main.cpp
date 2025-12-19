@@ -6,36 +6,38 @@
 #include "Sparrow.h"
 #include "SVGExport.h"
 #include <iomanip>
+#include "CLI11.hpp"
 
-int main() {
+
+int main(int argc, char **argv) {
+    CLI::App app{"Sparrow Packing Solver"};
+
+    std::string configFilePath = "config.txt";
+    std::string outputFilePath = "../output/solution.svg";
+    int num_tree = 3;
+
+    // Định nghĩa các option
+    app.add_option("-c,--config", configFilePath, "Path to configuration file");
+    app.add_option("-o,--output", outputFilePath, "Path to output SVG file");
+    app.add_option("-n,--num-tree", num_tree, "Number of trees");
+
+    // Parse (Macro này tự bắt lỗi và hiện help nếu cần)
+    CLI11_PARSE(app, argc, argv);
+
     // 1. Tạo dữ liệu (15 cây thông)
     std::vector<CompositeShape> items;
-    for(int i=0; i<5; ++i) items.push_back(createTree());
+    for(int i=0; i < num_tree; ++i) items.push_back(createTree());
 
     // 2. Cấu hình
     SparrowConfig config;
-    config.container_size = 1.2; // Kích thước khởi tạo (nên đủ lớn)
-    config.max_iter = 1000;       // Iteration cho hàm separate (Inner loop)
-    config.n_samples = 2048;
-    config.n_threads = -1;
-    config.Nc = 20;         // Reduce inner iters
-    config.Nx = 10;
-    config.Kc = 3;
-    config.Kx = 2;
-    config.TLx = 10.0;      // 10 seconds for explore
-    config.TLc = 10.0;      // 10 seconds for compress
-    config.Rx = 0.0005;      // Slightly larger shrink to converge faster
-    config.Rs_c = 0.005;
-    config.Re_c = 0.0005;
+    config.loadFromFile(configFilePath);
 
-    // 3. Chạy Solver
     SparrowSolver solver(items, config);
-    solver.solve(); // Chạy toàn bộ quy trình Algo 10->13
+    solver.solve();
     double side = solver.getContainerSize();
     double score = side * side / items.size();
     std::cout << ">>> Final Score: " << std::setprecision(10) << std::fixed << score << std::endl;
-    exportToSVG("../output/ket_qua_sparrow.svg", solver, 40.0);
+    exportToSVG(outputFilePath, solver, 40.0);
 
-    // 4. Kết quả nằm trong solver.items và solver.getContainerSize()
     return 0;
 }

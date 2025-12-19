@@ -4,6 +4,8 @@
 
 #include <vector>
 #include <random>
+#include <iostream>
+#include <fstream>
 #include "Geometry.h"
 
 // Cấu trúc lưu trữ cấu hình thuật toán (thêm tham số từ Table 1 trong paper)
@@ -28,6 +30,63 @@ struct SparrowConfig {
     double Mu = 1.1;       // Multiplier up (GLS)
     int max_outer_loops = 20;
     int max_restart = 10;
+
+    // Hàm load từ file
+    void loadFromFile(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << "Warning: Could not open config file " << filename 
+                      << ". Using default values." << std::endl;
+            return;
+        }
+
+        std::string line;
+        while (std::getline(file, line)) {
+            // Xóa comment (phần sau dấu #)
+            size_t commentPos = line.find('#');
+            if (commentPos != std::string::npos) {
+                line = line.substr(0, commentPos);
+            }
+
+            // Tìm dấu =
+            size_t delimiterPos = line.find('=');
+            if (delimiterPos == std::string::npos) continue;
+
+            // Tách key và value
+            std::string key = line.substr(0, delimiterPos);
+            std::string value = line.substr(delimiterPos + 1);
+
+            // Xóa khoảng trắng thừa (trim)
+            auto trim = [](std::string& s) {
+                s.erase(0, s.find_first_not_of(" \t\r\n"));
+                s.erase(s.find_last_not_of(" \t\r\n") + 1);
+            };
+            trim(key);
+            trim(value);
+
+            if (key.empty() || value.empty()) continue;
+
+            try {
+                // Gán giá trị tương ứng
+                if (key == "container_size") container_size = std::stod(value);
+                else if (key == "max_iter") max_iter = std::stoi(value);
+                else if (key == "n_samples") n_samples = std::stoi(value);
+                else if (key == "n_threads") n_threads = std::stoi(value);
+                else if (key == "Nc") Nc = std::stoi(value);
+                else if (key == "Nx") Nx = std::stoi(value);
+                else if (key == "Kc") Kc = std::stoi(value);
+                else if (key == "Kx") Kx = std::stoi(value);
+                else if (key == "TLx") TLx = std::stod(value);
+                else if (key == "TLc") TLc = std::stod(value);
+                else if (key == "Rx") Rx = std::stod(value);
+                else if (key == "Rs_c") Rs_c = std::stod(value);
+                else if (key == "Re_c") Re_c = std::stod(value);
+            } catch (const std::exception& e) {
+                std::cerr << "Error parsing key: " << key << " value: " << value << std::endl;
+            }
+        }
+        std::cout << ">>> Config loaded from " << filename << std::endl;
+    }
 };
 
 class SparrowSolver {
