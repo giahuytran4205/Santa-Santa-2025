@@ -10,6 +10,7 @@
 
 
 int main(int argc, char **argv) {
+    auto start = std::chrono::high_resolution_clock::now();
     CLI::App app{"Sparrow Packing Solver"};
 
     std::string configFilePath = "../config.txt";
@@ -38,6 +39,10 @@ int main(int argc, char **argv) {
     double score = side * side / items.size();
     std::cout << ">>> Final Score: " << std::setprecision(10) << std::fixed << score << std::endl;
     exportToSVG(outputFilePath, solver, 40.0);
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Running time: " << elapsed.count() / 60 << " minutes" << std::endl;
 
     return 0;
 }
