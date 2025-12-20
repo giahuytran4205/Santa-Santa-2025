@@ -130,10 +130,10 @@ double SparrowSolver::evaluateSample(int itemIdx, Vec2 pos, double angle,
         if (j == itemIdx) continue;
 
         if (tempItem.totalAABB.overlaps(local_items[j].totalAABB)) {
-             double overlap = quantify_collision(tempItem, local_items[j]);
-             if (overlap > 1e-9) {
-                 totalCost += overlap * local_weights[itemIdx][j];
-             }
+            double overlap = quantify_collision(tempItem, local_items[j]);
+            if (overlap > 1e-9) {
+                totalCost += overlap * local_weights[itemIdx][j];
+            }
         }
     }
     return totalCost;
