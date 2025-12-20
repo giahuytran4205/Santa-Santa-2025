@@ -42,6 +42,10 @@ bool checkCollisionComposite(const CompositeShape& shapeA, const CompositeShape&
 }
 
 double quantify_collision(const CompositeShape& shapeA, const CompositeShape& shapeB) {
+    double distSq = (shapeA.pos - shapeB.pos).lengthSq();
+    double rSum = (shapeA.diameter + shapeB.diameter) * 0.5;
+    if (distSq > rSum * rSum) return 0.0;
+    
     // 1. Broadphase siêu nhanh
     if (!shapeA.totalAABB.overlaps(shapeB.totalAABB)) return 0.0;
 

@@ -30,6 +30,7 @@ struct Vec2 {
     }
 
     FORCE_INLINE double length() const { return std::sqrt(x * x + y * y); }  // THÊM
+    FORCE_INLINE double lengthSq() const { return x * x + y * y; }
 
     bool operator==(const Vec2& other) const {
         return x == other.x && y == other.y;

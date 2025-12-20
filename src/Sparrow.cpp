@@ -8,6 +8,7 @@
 #include <chrono>
 #include <random>
 #include <iomanip>
+#include "SpatialGrid.h"
 
 // --- Helper Functions ---
 
@@ -100,16 +101,18 @@ SparrowSolver::SparrowSolver(const std::vector<CompositeShape>& inputItems, Spar
     initializePlacement();
 }
 
-// Algorithm 7: Evaluate Sample
-double SparrowSolver::evaluateSample(int itemIdx, Vec2 pos, double angle, const std::vector<CompositeShape>& local_items, const std::vector<std::vector<double>>& local_weights) const {
+// Thay thế hàm evaluateSample cũ bằng hàm này
+double SparrowSolver::evaluateSample(int itemIdx, Vec2 pos, double angle, 
+                                     const std::vector<CompositeShape>& local_items, 
+                                     const std::vector<std::vector<double>>& local_weights,
+                                     const std::vector<int>& candidates) const {
     CompositeShape tempItem = local_items[itemIdx];
     tempItem.setTransform(pos, angle); 
 
     double totalCost = 0.0;
     double halfSize = config.container_size / 2.0;
 
-    // 1. Wall Penalty (Soft Constraint)
-    // Giảm penalty xuống để gradient mượt hơn (10000 -> 100 * overlap)
+    // 1. Wall Penalty (Giữ nguyên logic cũ)
     const AABB& aabb = tempItem.totalAABB;
     double outOfBounds = 0.0;
     if (aabb.min.x < -halfSize) outOfBounds += (-halfSize - aabb.min.x);
@@ -117,16 +120,15 @@ double SparrowSolver::evaluateSample(int itemIdx, Vec2 pos, double angle, const 
     if (aabb.min.y < -halfSize) outOfBounds += (-halfSize - aabb.min.y);
     if (aabb.max.y > halfSize)  outOfBounds += (aabb.max.y - halfSize);
     
-    // Penalty lũy thừa để càng ra xa càng bị phạt nặng, nhưng ở gần biên thì nhẹ nhàng
     if (outOfBounds > 0) {
         totalCost += (outOfBounds * 100.0) + (outOfBounds * outOfBounds * 1000.0);
     }
 
-    // 2. Item Overlap (Weighted by GLS)
-    for (size_t j = 0; j < local_items.size(); ++j) {
-        if (static_cast<int>(j) == itemIdx) continue;
-        
-        // Chỉ check broadphase AABB trước cho nhanh
+    // 2. Item Overlap (CHỈ DUYỆT CANDIDATES)
+    // Tối ưu: Chỉ kiểm tra những vật nằm trong ô lân cận
+    for (int j : candidates) {
+        if (j == itemIdx) continue;
+
         if (tempItem.totalAABB.overlaps(local_items[j].totalAABB)) {
              double overlap = quantify_collision(tempItem, local_items[j]);
              if (overlap > 1e-9) {
@@ -137,73 +139,83 @@ double SparrowSolver::evaluateSample(int itemIdx, Vec2 pos, double angle, const 
     return totalCost;
 }
 
-// Algorithm 6: Search Position (Đã cải tiến cho Homogeneous/Symmetry)
+// Thay thế toàn bộ hàm searchPosition cũ
 void SparrowSolver::searchPosition(int itemIdx, std::vector<CompositeShape>& local_items, std::vector<std::vector<double>>& local_weights) {
+    // A. CHUẨN BỊ SPATIAL GRID
+    // 1. Tìm đường kính lớn nhất để làm kích thước ô
+    double maxDia = 0.0;
+    for(const auto& it : local_items) maxDia = std::max(maxDia, it.diameter);
+    
+    // 2. Xây dựng Grid (O(N))
+    SpatialGrid grid(config.container_size, maxDia);
+    for(int i = 0; i < local_items.size(); ++i) {
+        if (i == itemIdx) continue; // Không thêm chính nó vào grid
+        grid.insert(i, local_items[i].pos);
+    }
+
+    // Biến tạm dùng chung để tránh cấp phát bộ nhớ liên tục
+    static thread_local std::vector<int> candidates;
+    
+    // Helper Lambda để gọi hàm tính toán nhanh gọn
+    auto fastEvaluate = [&](Vec2 p, double a) -> double {
+        grid.getCandidates(p, candidates);
+        return evaluateSample(itemIdx, p, a, local_items, local_weights, candidates);
+    };
+
+    // --- BẮT ĐẦU TÌM KIẾM ---
     const CompositeShape& current = local_items[itemIdx];
     Transform current_t(current.pos, current.angle);
-    double current_e = evaluateSample(itemIdx, current_t.pos, current_t.angle, local_items, local_weights);
+    double current_e = fastEvaluate(current_t.pos, current_t.angle);
 
     std::vector<std::pair<double, Transform>> samples;
     samples.reserve(config.n_samples);
 
     double halfSize = config.container_size / 2.0;
-    double foc_radius = config.container_size * 0.15; // Tăng vùng tìm kiếm cục bộ lên chút
+    double foc_radius = config.container_size * 0.15; 
 
-    // 1. Global Random Samples (T_div) - 40%
+    // PHASE 1: GLOBAL SEARCH (40%) - Hard-code góc 0 và PI
     int n_div = (int)(config.n_samples * 0.4);
     for (int s = 0; s < n_div; ++s) {
         double x = randomDouble(-halfSize, halfSize);
         double y = randomDouble(-halfSize, halfSize);
         
-        // Bias Rotation: Ưu tiên 0 và PI (Up/Down) cho cây
-        double r = randomDouble(0, 1);
-        double rot;
-        if (r < 0.7) rot = (randomDouble(0, 1) < 0.5) ? 0.0 : PI; 
-        else rot = randomDouble(0, 2.0 * PI);
-        
-        // Thêm nhiễu góc
-        rot += randomDouble(-0.15, 0.15); 
+        // CHIẾN THUẬT: Chỉ thử góc 0 (đứng) hoặc PI (úp) + nhiễu cực nhỏ
+        double rot = (std::rand() % 2 == 0) ? 0.0 : 3.14159265359;
+        rot += randomDouble(-0.01, 0.01);
 
-        double e = evaluateSample(itemIdx, {x, y}, rot, local_items, local_weights);
+        double e = fastEvaluate({x, y}, rot);
         samples.emplace_back(e, Transform({x, y}, rot));
     }
 
-    // 2. Local Samples (T_foc) - 40%
+    // PHASE 2: LOCAL SEARCH (40%) - Giữ góc cũ, lắc vị trí
     int n_foc = (int)(config.n_samples * 0.4);
     for (int s = 0; s < n_foc; ++s) {
         double dx = randomDouble(-foc_radius, foc_radius);
         double dy = randomDouble(-foc_radius, foc_radius);
-        double x = current.pos.x + dx;
-        double y = current.pos.y + dy;
         
-        // Giữ góc hiện tại + nhiễu
-        double drot = randomDouble(-0.2, 0.2); 
-        double rot = current.angle + drot;
+        double rot = current.angle + randomDouble(-0.02, 0.02); 
 
-        double e = evaluateSample(itemIdx, {x, y}, rot, local_items, local_weights);
-        samples.emplace_back(e, Transform({x, y}, rot));
+        double e = fastEvaluate(current.pos + Vec2{dx, dy}, rot);
+        samples.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, rot));
     }
 
-    // 3. FLIP SAMPLES (Quan trọng nhất cho đối xứng trục) - 20%
-    // Thử lật ngược vật thể tại vị trí hiện tại (hoặc lân cận)
+    // PHASE 3: FLIP SEARCH (20%) - Lật ngược tại chỗ
     int n_flip = config.n_samples - n_div - n_foc;
     for (int s = 0; s < n_flip; ++s) {
-        double dx = randomDouble(-foc_radius*0.5, foc_radius*0.5);
-        double dy = randomDouble(-foc_radius*0.5, foc_radius*0.5);
-        double x = current.pos.x + dx;
-        double y = current.pos.y + dy;
+        double dx = randomDouble(-foc_radius, foc_radius);
+        double dy = randomDouble(-foc_radius, foc_radius);
+        
+        // Lật 180 độ
+        double rot = current.angle + 3.14159265359 + randomDouble(-0.01, 0.01);
+        while (rot > 6.28318530718) rot -= 6.28318530718;
 
-        // LẬT 180 độ so với góc hiện tại
-        double rot = current.angle + PI + randomDouble(-0.1, 0.1); 
-
-        double e = evaluateSample(itemIdx, {x, y}, rot, local_items, local_weights);
-        samples.emplace_back(e, Transform({x, y}, rot));
+        double e = fastEvaluate(current.pos + Vec2{dx, dy}, rot);
+        samples.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, rot));
     }
 
-    // Sort chọn cái tốt nhất
+    // --- LỰA CHỌN VÀ TINH CHỈNH (COORDINATE DESCENT) ---
     std::sort(samples.begin(), samples.end());
 
-    // Refinement (Coordinate Descent) cho top K
     int K = 3; 
     Transform best_t = current_t;
     double best_e = current_e;
@@ -211,29 +223,28 @@ void SparrowSolver::searchPosition(int itemIdx, std::vector<CompositeShape>& loc
     for (int i = 0; i < std::min(K, (int)samples.size()); ++i) {
         Transform t = samples[i].second;
         double e = samples[i].first;
+        if (e > current_e * 1.5) continue; // Pruning
 
-        // Nếu mẫu thử tệ hơn nhiều so với hiện tại thì bỏ qua (trừ khi đang early stage)
-        if (e > current_e * 1.5) continue;
-
-        // Adaptive Descent
         double step = foc_radius * 0.5;
-        double rot_step = 0.1; // ~5.7 độ
+        double rot_step = 0.05; 
         
-        for (int iter = 0; iter < 10; ++iter) { 
+        for (int iter = 0; iter < 15; ++iter) { // Tăng số bước lặp local
             bool improved = false;
             // X
             for (double d : {-step, step}) {
-                double ne = evaluateSample(itemIdx, t.pos + Vec2{d,0}, t.angle, local_items, local_weights);
+                // Lưu ý: Cập nhật candidates khi vị trí thay đổi đáng kể (nếu cần)
+                // Tuy nhiên với step nhỏ, candidates cũ vẫn đúng -> Dùng fastEvaluate
+                double ne = fastEvaluate(t.pos + Vec2{d,0}, t.angle);
                 if (ne < e) { t.pos.x += d; e = ne; improved = true; }
             }
             // Y
             for (double d : {-step, step}) {
-                double ne = evaluateSample(itemIdx, t.pos + Vec2{0,d}, t.angle, local_items, local_weights);
+                double ne = fastEvaluate(t.pos + Vec2{0,d}, t.angle);
                 if (ne < e) { t.pos.y += d; e = ne; improved = true; }
             }
             // Angle
             for (double d : {-rot_step, rot_step}) {
-                double ne = evaluateSample(itemIdx, t.pos, t.angle + d, local_items, local_weights);
+                double ne = fastEvaluate(t.pos, t.angle + d);
                 if (ne < e) { t.angle += d; e = ne; improved = true; }
             }
             
@@ -250,7 +261,6 @@ void SparrowSolver::searchPosition(int itemIdx, std::vector<CompositeShape>& loc
         }
     }
 
-    // Apply best
     if (best_e < current_e) {
         local_items[itemIdx].setTransform(best_t.pos, best_t.angle);
     }

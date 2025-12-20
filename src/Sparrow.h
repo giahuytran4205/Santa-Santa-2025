@@ -110,7 +110,10 @@ private:
     void loadState();
 
     // Algorithm 7: Tính chi phí (Overlap + Penalty) tại một vị trí giả định
-    double evaluateSample(int itemIdx, Vec2 pos, double angle, const std::vector<CompositeShape>& local_items, const std::vector<std::vector<double>>& local_weights) const;
+    double evaluateSample(int itemIdx, Vec2 pos, double angle, 
+                          const std::vector<CompositeShape>& local_items, 
+                          const std::vector<std::vector<double>>& local_weights,
+                          const std::vector<int>& candidates) const;
 
     // Algorithm 6: Tìm vị trí mới tốt hơn cho một vật thể
     void searchPosition(int itemIdx, std::vector<CompositeShape>& local_items, std::vector<std::vector<double>>& local_weights);
