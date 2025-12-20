@@ -137,107 +137,131 @@ double SparrowSolver::evaluateSample(int itemIdx, Vec2 pos, double angle, const 
     return totalCost;
 }
 
-// [Thay thế hàm searchPosition cũ bằng đoạn này]
+// [Trong src/Sparrow.cpp]
+
+#include <omp.h> // Đảm bảo đã include
+
 void SparrowSolver::searchPosition(int itemIdx, std::vector<CompositeShape>& local_items, std::vector<std::vector<double>>& local_weights) {
     const CompositeShape& current = local_items[itemIdx];
-    Transform current_t(current.pos, current.angle);
-    double current_e = evaluateSample(itemIdx, current_t.pos, current_t.angle, local_items, local_weights);
+    // Tính năng lượng hiện tại (đơn luồng vì chỉ tính 1 cái)
+    double current_e = evaluateSample(itemIdx, current.pos, current.angle, local_items, local_weights);
 
-    std::vector<std::pair<double, Transform>> samples;
-    samples.reserve(config.n_samples);
+    // Vector tổng để chứa kết quả từ tất cả các luồng
+    std::vector<std::pair<double, Transform>> all_samples;
+    // Dự trù bộ nhớ để tránh cấp phát lại nhiều lần
+    all_samples.reserve(config.n_samples);
 
     double halfSize = config.container_size / 2.0;
-    double foc_radius = config.container_size * 0.15; 
-
-    // --- PHASE 1: GLOBAL SEARCH (40%) ---
-    // Tìm vị trí mới. Thay vì random góc, ta ép nó thử ngay 2 thế: Đứng (0) và Úp (PI)
+    double foc_radius = config.container_size * 0.15;
+    
+    // Tính số lượng mẫu cho từng pha
     int n_div = (int)(config.n_samples * 0.4);
-    for (int s = 0; s < n_div; ++s) {
-        double x = randomDouble(-halfSize, halfSize);
-        double y = randomDouble(-halfSize, halfSize);
-        
-        // HARD-CODE: Chọn ngẫu nhiên 0 hoặc PI
-        double rot = (std::rand() % 2 == 0) ? 0.0 : 3.14159265359;
-        
-        // Thêm nhiễu cực nhỏ (+- 0.5 độ) để thuật toán trượt được nếu bị kẹt nhẹ
-        rot += randomDouble(-0.01, 0.01); 
-
-        double e = evaluateSample(itemIdx, {x, y}, rot, local_items, local_weights);
-        samples.emplace_back(e, Transform({x, y}, rot));
-    }
-
-    // --- PHASE 2: LOCAL SEARCH (40%) ---
-    // Giữ nguyên góc hiện tại, chỉ lắc nhẹ vị trí để tìm khe hở tốt hơn
     int n_foc = (int)(config.n_samples * 0.4);
-    for (int s = 0; s < n_foc; ++s) {
-        double dx = randomDouble(-foc_radius, foc_radius);
-        double dy = randomDouble(-foc_radius, foc_radius);
-        
-        // Giữ góc cũ + nhiễu nhẹ
-        double rot = current.angle + randomDouble(-0.02, 0.02); 
-
-        double e = evaluateSample(itemIdx, current.pos + Vec2{dx, dy}, rot, local_items, local_weights);
-        samples.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, rot));
-    }
-
-    // --- PHASE 3: FLIP SEARCH (20%) ---
-    // "Vũ khí bí mật": Thử lật ngược vật thể 180 độ ngay tại chỗ
     int n_flip = config.n_samples - n_div - n_foc;
-    for (int s = 0; s < n_flip; ++s) {
-        double dx = randomDouble(-foc_radius, foc_radius);
-        double dy = randomDouble(-foc_radius, foc_radius);
+
+    // --- BẮT ĐẦU VÙNG SONG SONG (PARALLEL REGION) ---
+    // Mở ra các luồng, mỗi luồng có biến riêng
+    #pragma omp parallel
+    {
+        // 1. Khởi tạo RNG riêng cho từng luồng (Tránh tranh chấp khóa)
+        // Dùng thời gian + id luồng để tạo seed khác nhau
+        unsigned int seed = (unsigned int)(std::chrono::system_clock::now().time_since_epoch().count() + omp_get_thread_num());
+        std::mt19937 rng(seed);
+        std::uniform_real_distribution<double> dist01(0.0, 1.0);
         
-        // Lật 180 độ
-        double rot = current.angle + 3.14159265359 + randomDouble(-0.01, 0.01);
+        // Helper lambda: random double local
+        auto randD = [&](double min, double max) {
+            return min + (max - min) * dist01(rng);
+        };
+
+        // 2. Vector riêng của luồng (Thread-local storage)
+        std::vector<std::pair<double, Transform>> thread_samples;
         
-        // Chuẩn hóa về [0, 2PI]
-        while (rot > 6.28318530718) rot -= 6.28318530718;
+        // --- PHASE 1: GLOBAL SEARCH (Chia đều công việc cho các luồng) ---
+        #pragma omp for nowait // nowait: xong việc thì đi tiếp, không cần chờ luồng khác
+        for (int s = 0; s < n_div; ++s) {
+            double x = randD(-halfSize, halfSize);
+            double y = randD(-halfSize, halfSize);
+            
+            // Góc 0 hoặc PI + nhiễu
+            double rot = ((int)(randD(0, 100)) % 2 == 0) ? 0.0 : 3.14159265359;
+            rot += randD(-0.01, 0.01);
 
-        double e = evaluateSample(itemIdx, current.pos + Vec2{dx, dy}, rot, local_items, local_weights);
-        samples.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, rot));
-    }
+            double e = evaluateSample(itemIdx, {x, y}, rot, local_items, local_weights);
+            thread_samples.emplace_back(e, Transform({x, y}, rot));
+        }
 
-    // Sort và chọn top K (Giữ nguyên logic cũ)
-    std::sort(samples.begin(), samples.end());
+        // --- PHASE 2: LOCAL SEARCH ---
+        #pragma omp for nowait
+        for (int s = 0; s < n_foc; ++s) {
+            double dx = randD(-foc_radius, foc_radius);
+            double dy = randD(-foc_radius, foc_radius);
+            double rot = current.angle + randD(-0.02, 0.02);
 
-    // --- REFINEMENT (Coordinate Descent) ---
-    // Copy lại logic cũ của bạn, nhưng giảm step xoay xuống
+            double e = evaluateSample(itemIdx, current.pos + Vec2{dx, dy}, rot, local_items, local_weights);
+            thread_samples.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, rot));
+        }
+
+        // --- PHASE 3: FLIP SEARCH ---
+        #pragma omp for nowait
+        for (int s = 0; s < n_flip; ++s) {
+            double dx = randD(-foc_radius, foc_radius);
+            double dy = randD(-foc_radius, foc_radius);
+            double rot = current.angle + PI + randD(-0.01, 0.01);
+            while (rot > 2 * PI) rot -= 2 * PI;
+
+            double e = evaluateSample(itemIdx, current.pos + Vec2{dx, dy}, rot, local_items, local_weights);
+            thread_samples.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, rot));
+        }
+
+        // 3. Gom kết quả (Critical section: Chỉ 1 luồng được ghi vào all_samples tại 1 thời điểm)
+        // Đoạn này rất nhanh vì chỉ là move pointer vector
+        #pragma omp critical
+        {
+            all_samples.insert(all_samples.end(), thread_samples.begin(), thread_samples.end());
+        }
+    } // Kết thúc vùng song song
+
+    // --- SORT & COORDINATE DESCENT (Chạy đơn luồng vì số lượng K nhỏ) ---
+    // Phần này giữ nguyên logic cũ vì nó tuần tự và phụ thuộc lẫn nhau
+    std::sort(all_samples.begin(), all_samples.end());
+
     int K = 3; 
-    Transform best_t = current_t;
+    Transform best_t(current.pos, current.angle);
     double best_e = current_e;
 
-    for (int i = 0; i < std::min(K, (int)samples.size()); ++i) {
-        Transform t = samples[i].second;
-        double e = samples[i].first;
+    // ... (Đoạn Code Coordinate Descent phía sau giữ nguyên y hệt cũ) ...
+    // Copy lại đoạn vòng lặp K và Coordinate Descent vào đây
+    for (int i = 0; i < std::min(K, (int)all_samples.size()); ++i) {
+        Transform t = all_samples[i].second;
+        double e = all_samples[i].first;
         if (e > current_e * 1.5) continue;
 
         double step = foc_radius * 0.5;
-        double rot_step = 0.05; // ~3 độ
+        double rot_step = 0.05; 
         
-        for (int iter = 0; iter < 15; ++iter) { // Tăng số lần lặp lên 15
-            bool improved = false;
-            // X
-            for (double d : {-step, step}) {
-                double ne = evaluateSample(itemIdx, t.pos + Vec2{d,0}, t.angle, local_items, local_weights);
-                if (ne < e) { t.pos.x += d; e = ne; improved = true; }
-            }
-            // Y
-            for (double d : {-step, step}) {
-                double ne = evaluateSample(itemIdx, t.pos + Vec2{0,d}, t.angle, local_items, local_weights);
-                if (ne < e) { t.pos.y += d; e = ne; improved = true; }
-            }
-            // Angle
-            for (double d : {-rot_step, rot_step}) {
-                double ne = evaluateSample(itemIdx, t.pos, t.angle + d, local_items, local_weights);
-                if (ne < e) { t.angle += d; e = ne; improved = true; }
-            }
-            
-            if (!improved) {
-                step *= 0.5;
-                rot_step *= 0.5;
-            }
-            if (step < 1e-4) break;
+        for (int iter = 0; iter < 20; ++iter) { 
+             // Logic descent giữ nguyên...
+             bool improved = false;
+             // X
+             for (double d : {-step, step}) {
+                 double ne = evaluateSample(itemIdx, t.pos + Vec2{d,0}, t.angle, local_items, local_weights);
+                 if (ne < e) { t.pos.x += d; e = ne; improved = true; }
+             }
+             // Y
+             for (double d : {-step, step}) {
+                 double ne = evaluateSample(itemIdx, t.pos + Vec2{0,d}, t.angle, local_items, local_weights);
+                 if (ne < e) { t.pos.y += d; e = ne; improved = true; }
+             }
+             // Angle
+             for (double d : {-rot_step, rot_step}) {
+                 double ne = evaluateSample(itemIdx, t.pos, t.angle + d, local_items, local_weights);
+                 if (ne < e) { t.angle += d; e = ne; improved = true; }
+             }
+             if (!improved) { step *= 0.5; rot_step *= 0.5; }
+             if (step < 1e-4) break;
         }
+
         if (e < best_e) { best_e = e; best_t = t; }
     }
 
