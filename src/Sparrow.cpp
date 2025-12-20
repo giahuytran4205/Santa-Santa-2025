@@ -124,16 +124,16 @@ double SparrowSolver::evaluateSample(int itemIdx, Vec2 pos, double angle,
         totalCost += (outOfBounds * 100.0) + (outOfBounds * outOfBounds * 1000.0);
     }
 
-    // 2. Item Overlap (CHỈ DUYỆT CANDIDATES)
-    // Tối ưu: Chỉ kiểm tra những vật nằm trong ô lân cận
-    for (int j : candidates) {
-        if (j == itemIdx) continue;
-
+    for (size_t j = 0; j < local_items.size(); ++j) {
+        if ((int)j == itemIdx) continue;
+        
+        // 1. Broadphase: Kiểm tra hình chữ nhật bao (Siêu nhanh)
         if (tempItem.totalAABB.overlaps(local_items[j].totalAABB)) {
-            double overlap = quantify_collision(tempItem, local_items[j]);
-            if (overlap > 1e-9) {
-                totalCost += overlap * local_weights[itemIdx][j];
-            }
+             // 2. Narrowphase: Tính toán va chạm chi tiết
+             double overlap = quantify_collision(tempItem, local_items[j]);
+             if (overlap > 1e-9) {
+                 totalCost += overlap * local_weights[itemIdx][j];
+             }
         }
     }
     return totalCost;
