@@ -1,4 +1,4 @@
-// Sparrow.cpp
+// src/Sparrow.cpp
 #include "Sparrow.h"
 #include "Collision.h"
 #include <iostream>
@@ -15,8 +15,9 @@
 double SparrowSolver::randomDouble(double min, double max) {
     static thread_local std::mt19937* local_rng = nullptr;
     if (!local_rng) {
-        std::random_device rd;
-        local_rng = new std::mt19937(rd() + omp_get_thread_num());
+        // Seed based on time and thread ID to ensure independence
+        unsigned int seed = (unsigned int)(std::chrono::system_clock::now().time_since_epoch().count() + omp_get_thread_num());
+        local_rng = new std::mt19937(seed);
     }
     std::uniform_real_distribution<double> dist(min, max);
     return dist(*local_rng);
@@ -32,7 +33,6 @@ void SparrowSolver::loadState() {
     config.container_size = savedContainerSize;
 }
 
-// Khởi tạo thông minh hơn: Xếp lưới nhưng xen kẽ hướng (Up/Down)
 void SparrowSolver::initializePlacement() {
     double halfSize = config.container_size / 2.0;
     int n = items.size();
@@ -40,7 +40,6 @@ void SparrowSolver::initializePlacement() {
     double spacing = config.container_size / rows;
     int idx = 0;
     
-    // Shuffle thứ tự để tránh bias
     std::vector<int> indices(n);
     std::iota(indices.begin(), indices.end(), 0);
     std::shuffle(indices.begin(), indices.end(), rng);
@@ -51,11 +50,9 @@ void SparrowSolver::initializePlacement() {
             double x = -halfSize + spacing * (c + 0.5);
             double y = -halfSize + spacing * (r + 0.5);
             
-            // Heuristic: Lưới bàn cờ (Chessboard pattern) cho hướng xoay
-            // Một cây hướng lên (0), cây bên cạnh hướng xuống (PI)
+            // Chessboard heuristic
             double rot = ((r + c) % 2 == 0) ? 0.0 : PI;
             
-            // Thêm nhiễu nhẹ để không quá cứng nhắc
             rot += randomDouble(-0.1, 0.1); 
             double jitter = spacing * 0.1;
             x += randomDouble(-jitter, jitter);
@@ -68,7 +65,6 @@ void SparrowSolver::initializePlacement() {
     std::cout << "Initialized placement (Chessboard heuristic), initial energy: " << getTotalEnergy() << std::endl;
 }
 
-// Constructor
 SparrowSolver::SparrowSolver(const std::vector<CompositeShape>& inputItems, SparrowConfig cfg) 
     : items(inputItems), config(cfg) {
         
@@ -82,7 +78,7 @@ SparrowSolver::SparrowSolver(const std::vector<CompositeShape>& inputItems, Spar
     {
         #pragma omp single
         {
-            std::cout << ">>> OpenMP Running with " << omp_get_num_threads() << " threads." << std::endl;
+            std::cout << ">>> OpenMP Optimized Solver Running with " << omp_get_num_threads() << " threads." << std::endl;
         }
     }
     
@@ -108,8 +104,7 @@ double SparrowSolver::evaluateSample(int itemIdx, Vec2 pos, double angle, const 
     double totalCost = 0.0;
     double halfSize = config.container_size / 2.0;
 
-    // 1. Wall Penalty (Soft Constraint)
-    // Giảm penalty xuống để gradient mượt hơn (10000 -> 100 * overlap)
+    // 1. Wall Penalty
     const AABB& aabb = tempItem.totalAABB;
     double outOfBounds = 0.0;
     if (aabb.min.x < -halfSize) outOfBounds += (-halfSize - aabb.min.x);
@@ -117,16 +112,14 @@ double SparrowSolver::evaluateSample(int itemIdx, Vec2 pos, double angle, const 
     if (aabb.min.y < -halfSize) outOfBounds += (-halfSize - aabb.min.y);
     if (aabb.max.y > halfSize)  outOfBounds += (aabb.max.y - halfSize);
     
-    // Penalty lũy thừa để càng ra xa càng bị phạt nặng, nhưng ở gần biên thì nhẹ nhàng
     if (outOfBounds > 0) {
         totalCost += (outOfBounds * 100.0) + (outOfBounds * outOfBounds * 1000.0);
     }
 
-    // 2. Item Overlap (Weighted by GLS)
+    // 2. Item Overlap
     for (size_t j = 0; j < local_items.size(); ++j) {
         if (static_cast<int>(j) == itemIdx) continue;
         
-        // Chỉ check broadphase AABB trước cho nhanh
         if (tempItem.totalAABB.overlaps(local_items[j].totalAABB)) {
              double overlap = quantify_collision(tempItem, local_items[j]);
              if (overlap > 1e-9) {
@@ -137,111 +130,67 @@ double SparrowSolver::evaluateSample(int itemIdx, Vec2 pos, double angle, const 
     return totalCost;
 }
 
-// [Trong src/Sparrow.cpp]
-
-#include <omp.h> // Đảm bảo đã include
-
+// --- OPTIMIZED SEARCH: Sequential logic (called by parallel workers) ---
 void SparrowSolver::searchPosition(int itemIdx, std::vector<CompositeShape>& local_items, std::vector<std::vector<double>>& local_weights) {
     const CompositeShape& current = local_items[itemIdx];
-    // Tính năng lượng hiện tại (đơn luồng vì chỉ tính 1 cái)
     double current_e = evaluateSample(itemIdx, current.pos, current.angle, local_items, local_weights);
 
-    // Vector tổng để chứa kết quả từ tất cả các luồng
-    std::vector<std::pair<double, Transform>> all_samples;
-    // Dự trù bộ nhớ để tránh cấp phát lại nhiều lần
-    all_samples.reserve(config.n_samples);
+    std::vector<std::pair<double, Transform>> candidates;
+    candidates.reserve(config.n_samples);
 
     double halfSize = config.container_size / 2.0;
     double foc_radius = config.container_size * 0.15;
     
-    // Tính số lượng mẫu cho từng pha
     int n_div = (int)(config.n_samples * 0.4);
     int n_foc = (int)(config.n_samples * 0.4);
     int n_flip = config.n_samples - n_div - n_foc;
 
-    // --- BẮT ĐẦU VÙNG SONG SONG (PARALLEL REGION) ---
-    // Mở ra các luồng, mỗi luồng có biến riêng
-    #pragma omp parallel
-    {
-        // 1. Khởi tạo RNG riêng cho từng luồng (Tránh tranh chấp khóa)
-        // Dùng thời gian + id luồng để tạo seed khác nhau
-        unsigned int seed = (unsigned int)(std::chrono::system_clock::now().time_since_epoch().count() + omp_get_thread_num());
-        std::mt19937 rng(seed);
-        std::uniform_real_distribution<double> dist01(0.0, 1.0);
-        
-        // Helper lambda: random double local
-        auto randD = [&](double min, double max) {
-            return min + (max - min) * dist01(rng);
-        };
+    // Phase 1: Global
+    for (int s = 0; s < n_div; ++s) {
+        double x = randomDouble(-halfSize, halfSize);
+        double y = randomDouble(-halfSize, halfSize);
+        double rot = ((int)(randomDouble(0, 100)) % 2 == 0) ? 0.0 : PI;
+        rot += randomDouble(-0.01, 0.01);
+        double e = evaluateSample(itemIdx, {x, y}, rot, local_items, local_weights);
+        candidates.emplace_back(e, Transform({x, y}, rot));
+    }
 
-        // 2. Vector riêng của luồng (Thread-local storage)
-        std::vector<std::pair<double, Transform>> thread_samples;
-        
-        // --- PHASE 1: GLOBAL SEARCH (Chia đều công việc cho các luồng) ---
-        #pragma omp for nowait // nowait: xong việc thì đi tiếp, không cần chờ luồng khác
-        for (int s = 0; s < n_div; ++s) {
-            double x = randD(-halfSize, halfSize);
-            double y = randD(-halfSize, halfSize);
-            
-            // Góc 0 hoặc PI + nhiễu
-            double rot = ((int)(randD(0, 100)) % 2 == 0) ? 0.0 : 3.14159265359;
-            rot += randD(-0.01, 0.01);
+    // Phase 2: Local
+    for (int s = 0; s < n_foc; ++s) {
+        double dx = randomDouble(-foc_radius, foc_radius);
+        double dy = randomDouble(-foc_radius, foc_radius);
+        double rot = current.angle + randomDouble(-0.02, 0.02);
+        double e = evaluateSample(itemIdx, current.pos + Vec2{dx, dy}, rot, local_items, local_weights);
+        candidates.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, rot));
+    }
 
-            double e = evaluateSample(itemIdx, {x, y}, rot, local_items, local_weights);
-            thread_samples.emplace_back(e, Transform({x, y}, rot));
-        }
+    // Phase 3: Flip
+    for (int s = 0; s < n_flip; ++s) {
+        double dx = randomDouble(-foc_radius, foc_radius);
+        double dy = randomDouble(-foc_radius, foc_radius);
+        double rot = current.angle + PI + randomDouble(-0.01, 0.01);
+        while (rot > 2 * PI) rot -= 2 * PI;
+        double e = evaluateSample(itemIdx, current.pos + Vec2{dx, dy}, rot, local_items, local_weights);
+        candidates.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, rot));
+    }
 
-        // --- PHASE 2: LOCAL SEARCH ---
-        #pragma omp for nowait
-        for (int s = 0; s < n_foc; ++s) {
-            double dx = randD(-foc_radius, foc_radius);
-            double dy = randD(-foc_radius, foc_radius);
-            double rot = current.angle + randD(-0.02, 0.02);
+    // Sort best candidates
+    std::sort(candidates.begin(), candidates.end());
 
-            double e = evaluateSample(itemIdx, current.pos + Vec2{dx, dy}, rot, local_items, local_weights);
-            thread_samples.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, rot));
-        }
-
-        // --- PHASE 3: FLIP SEARCH ---
-        #pragma omp for nowait
-        for (int s = 0; s < n_flip; ++s) {
-            double dx = randD(-foc_radius, foc_radius);
-            double dy = randD(-foc_radius, foc_radius);
-            double rot = current.angle + PI + randD(-0.01, 0.01);
-            while (rot > 2 * PI) rot -= 2 * PI;
-
-            double e = evaluateSample(itemIdx, current.pos + Vec2{dx, dy}, rot, local_items, local_weights);
-            thread_samples.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, rot));
-        }
-
-        // 3. Gom kết quả (Critical section: Chỉ 1 luồng được ghi vào all_samples tại 1 thời điểm)
-        // Đoạn này rất nhanh vì chỉ là move pointer vector
-        #pragma omp critical
-        {
-            all_samples.insert(all_samples.end(), thread_samples.begin(), thread_samples.end());
-        }
-    } // Kết thúc vùng song song
-
-    // --- SORT & COORDINATE DESCENT (Chạy đơn luồng vì số lượng K nhỏ) ---
-    // Phần này giữ nguyên logic cũ vì nó tuần tự và phụ thuộc lẫn nhau
-    std::sort(all_samples.begin(), all_samples.end());
-
+    // Coordinate Descent on top K candidates
     int K = 3; 
     Transform best_t(current.pos, current.angle);
     double best_e = current_e;
 
-    // ... (Đoạn Code Coordinate Descent phía sau giữ nguyên y hệt cũ) ...
-    // Copy lại đoạn vòng lặp K và Coordinate Descent vào đây
-    for (int i = 0; i < std::min(K, (int)all_samples.size()); ++i) {
-        Transform t = all_samples[i].second;
-        double e = all_samples[i].first;
+    for (int i = 0; i < std::min(K, (int)candidates.size()); ++i) {
+        Transform t = candidates[i].second;
+        double e = candidates[i].first;
         if (e > current_e * 1.5) continue;
 
         double step = foc_radius * 0.5;
         double rot_step = 0.05; 
         
         for (int iter = 0; iter < 20; ++iter) { 
-             // Logic descent giữ nguyên...
              bool improved = false;
              // X
              for (double d : {-step, step}) {
@@ -280,7 +229,6 @@ double SparrowSolver::calculate_energy(const std::vector<CompositeShape>& local_
     // Item-Item Overlap
     for (size_t a = 0; a < local_items.size(); ++a) {
         for (size_t b = a + 1; b < local_items.size(); ++b) {
-            // Broadphase check
             if (local_items[a].totalAABB.overlaps(local_items[b].totalAABB)) {
                 energy += quantify_collision(local_items[a], local_items[b]);
             }
@@ -305,12 +253,17 @@ double SparrowSolver::calculate_energy(const std::vector<CompositeShape>& local_
 }
 
 void SparrowSolver::updateWeights(std::vector<std::vector<double>>& local_weights) {
+    // This is a placeholder for the class method, but we use the helper below in parallel.
+}
+
+// Helper to update weights inside worker
+void updateLocalWeights(std::vector<std::vector<double>>& w, const std::vector<CompositeShape>& it, const SparrowConfig& cfg) {
     double e_max = 0.0;
-    // Tìm max overlap hiện tại
-    for (size_t a = 0; a < items.size(); ++a) {
-        for (size_t b = a + 1; b < items.size(); ++b) {
-            if (items[a].totalAABB.overlaps(items[b].totalAABB)) {
-                double e = quantify_collision(items[a], items[b]);
+    size_t n = it.size();
+    for (size_t a = 0; a < n; ++a) {
+        for (size_t b = a + 1; b < n; ++b) {
+            if (it[a].totalAABB.overlaps(it[b].totalAABB)) {
+                double e = quantify_collision(it[a], it[b]);
                 if (e > e_max) e_max = e;
             }
         }
@@ -318,23 +271,19 @@ void SparrowSolver::updateWeights(std::vector<std::vector<double>>& local_weight
     
     if (e_max < 1e-9) return;
 
-    for (size_t a = 0; a < items.size(); ++a) {
-        for (size_t b = a + 1; b < items.size(); ++b) {
+    for (size_t a = 0; a < n; ++a) {
+        for (size_t b = a + 1; b < n; ++b) {
             double e = 0.0;
-            if (items[a].totalAABB.overlaps(items[b].totalAABB)) {
-                e = quantify_collision(items[a], items[b]);
+            if (it[a].totalAABB.overlaps(it[b].totalAABB)) {
+                e = quantify_collision(it[a], it[b]);
             }
             
             double m;
-            if (e > 1e-9) {
-                // Tăng trọng số cho cặp va chạm mạnh
-                m = config.Ml + (config.Mu - config.Ml) * (e / e_max);
-            } else {
-                // Giảm dần trọng số cho cặp đã an toàn
-                m = config.Md;
-            }
-            local_weights[a][b] = std::max(1.0, local_weights[a][b] * m);
-            local_weights[b][a] = local_weights[a][b]; 
+            if (e > 1e-9) m = cfg.Ml + (cfg.Mu - cfg.Ml) * (e / e_max);
+            else m = cfg.Md;
+            
+            w[a][b] = std::max(1.0, w[a][b] * m);
+            w[b][a] = w[a][b]; 
         }
     }
 }
@@ -348,13 +297,9 @@ void SparrowSolver::perform_move_items(std::vector<CompositeShape>& local_items,
         bool colliding = false;
         const AABB& aabb = local_items[i].totalAABB;
         
-        // Wall check
         if (aabb.min.x < -halfSize || aabb.max.x > halfSize || aabb.min.y < -halfSize || aabb.max.y > halfSize) {
             colliding = true;
-        }
-        
-        // Item check (nếu chưa chạm tường)
-        if (!colliding) {
+        } else {
             for (int j = 0; j < local_items.size(); ++j) {
                 if (i == j) continue;
                 if (local_items[i].totalAABB.overlaps(local_items[j].totalAABB)) {
@@ -370,135 +315,107 @@ void SparrowSolver::perform_move_items(std::vector<CompositeShape>& local_items,
 
     if (Ic.empty()) return;
 
-    std::random_device rd;
-    std::mt19937 local_rng(rd());
-    std::shuffle(Ic.begin(), Ic.end(), local_rng);
+    // --- FIX: Use correct thread-local RNG ---
+    static thread_local std::mt19937* local_rng_ptr = nullptr;
+    if(!local_rng_ptr) {
+         unsigned int seed = (unsigned int)(std::chrono::system_clock::now().time_since_epoch().count() + omp_get_thread_num());
+         local_rng_ptr = new std::mt19937(seed);
+    }
+    std::shuffle(Ic.begin(), Ic.end(), *local_rng_ptr);
 
     for (int i : Ic) {
         searchPosition(i, local_items, local_weights);
     }
 }
 
-void SparrowSolver::move_items_multi() {
-    // Biến chia sẻ (Shared) để lưu kết quả tốt nhất
-    double best_e = std::numeric_limits<double>::max();
-    
-    // Lưu ý: Không khởi tạo best_items ở đây để tránh copy không cần thiết nếu không tìm thấy cái mới
-    // Ta dùng cờ hoặc mutex để update sau.
-    // Tuy nhiên, logic cũ dùng critical section là an toàn.
-    
-    // Biến tạm để lưu kết quả tốt nhất tìm được trong lần chạy này (để hạn chế critical section)
-    std::vector<CompositeShape> current_best_items;
-    std::vector<std::vector<double>> current_best_weights;
-    bool found_improvement = false;
-
-    #pragma omp parallel 
-    {
-        // --- TỐI ƯU HÓA BỘ NHỚ ---
-        // Sử dụng static thread_local để biến này "sống" mãi theo từng luồng.
-        // Nó chỉ được cấp phát 1 lần duy nhất khi luồng khởi tạo, và được dùng lại mãi mãi.
-        static thread_local std::vector<CompositeShape> local_items;
-        static thread_local std::vector<std::vector<double>> local_weights;
-
-        // Gán dữ liệu mới vào vùng nhớ cũ (Reuse capacity)
-        // std::vector::operator= sẽ tái sử dụng vùng nhớ đã cấp phát nếu đủ chỗ.
-        // Điều này biến chi phí từ "malloc + copy" thành chỉ còn "copy" (nhanh hơn rất nhiều).
-        local_items = items; 
-        local_weights = weights;
-
-        // --- LOGIC XỬ LÝ ---
-        perform_move_items(local_items, local_weights);
-        updateWeights(local_weights);
-
-        double local_e = calculate_energy(local_items);
-        
-        // --- GOM KẾT QUẢ ---
-        // Kiểm tra nhanh trước khi vào critical section để tránh nghẽn cổ chai
-        if (local_e < best_e) {
-            #pragma omp critical
-            {
-                // Kiểm tra lại lần nữa trong vùng an toàn (Double-checked locking pattern)
-                if (local_e < best_e) {
-                    best_e = local_e;
-                    // Copy ra ngoài vùng shared
-                    // Lưu ý: Việc copy này ít xảy ra hơn nhiều so với việc tính toán
-                    current_best_items = local_items;
-                    current_best_weights = local_weights;
-                    found_improvement = true;
-                }
-            }
-        }
-    }
-
-    // Chỉ cập nhật vào items chính nếu tìm thấy cải thiện
-    if (found_improvement) {
-        items = current_best_items;
-        weights = current_best_weights;
-    }
-}
-
+// --- CORE PARALLEL OPTIMIZATION ---
 bool SparrowSolver::separate(int kmax, int nmax, double time_limit_sec) {
     auto start = std::chrono::steady_clock::now();
-    double e_star = getTotalEnergy();
-    std::vector<CompositeShape> s_star = items; 
     
-    int k = 0;
-    
-    // Nếu đã feasible ngay từ đầu
-    if (e_star <= 1e-4) return true;
+    // Initial best state
+    double best_global_energy = getTotalEnergy();
+    if (best_global_energy <= 1e-4) return true;
 
-    while (k < kmax) {
-        // Reset về state tốt nhất mỗi lần thử lại (Strike system)
-        items = s_star; 
+    // Flag to stop early if feasible solution found
+    bool solution_found = false;
+
+    // Start Parallel Region
+    // Each thread becomes an independent worker (Walker)
+    #pragma omp parallel
+    {
+        // 1. Thread-Local State Initialization (Copy from Master)
+        std::vector<CompositeShape> local_items = items;
+        std::vector<std::vector<double>> local_weights = weights;
         
-        int n = 0;
-        bool improved_in_try = false;
-
-        while (n < nmax) {
-            move_items_multi(); // Cập nhật items và weights
-            double e = getTotalEnergy();
+        // 2. Worker Loop
+        int k = 0;
+        while (k < kmax && !solution_found) {
             
-            if (e < e_star) {
-                e_star = e;
-                s_star = items;
-                improved_in_try = true;
-                // Nếu tìm thấy feasible thì return ngay
-                if (e_star <= 1e-4) {
-                    items = s_star;
-                    return true;
+            int n = 0;
+            bool improved_in_try = false;
+            double local_best_energy = calculate_energy(local_items);
+
+            while (n < nmax) {
+                // Check time limit periodically
+                if (n % 10 == 0) {
+                    if (solution_found) break; // Break inner loop
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
+                    if (elapsed > time_limit_sec) break;
                 }
-            }
 
-            // Tăng counter nếu không cải thiện
-            if (e >= e_star) {
-                n++;
-            } else {
-                // Nếu có cải thiện, reset counter để đào sâu tiếp
-                n = 0; 
-            }
+                // Move items (Sequential logic within worker)
+                perform_move_items(local_items, local_weights);
+                
+                // Update GLS weights
+                updateLocalWeights(local_weights, local_items, config);
 
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
-            if (elapsed > time_limit_sec) {
-                items = s_star;
-                return (e_star <= 1e-4);
+                double current_e = calculate_energy(local_items);
+
+                // Update Local Best
+                if (current_e < local_best_energy) {
+                    local_best_energy = current_e;
+                    improved_in_try = true;
+                }
+
+                // Check against Global Best
+                // Use double-checked locking to avoid mutex overhead
+                if (current_e < best_global_energy) {
+                    #pragma omp critical
+                    {
+                        if (current_e < best_global_energy) {
+                            best_global_energy = current_e;
+                            items = local_items; // Update Master State
+                            weights = local_weights;
+                            std::cout << "   [Worker " << omp_get_thread_num() << "] New Best Energy: " << best_global_energy << std::endl;
+                        }
+                        if (best_global_energy <= 1e-4) {
+                            solution_found = true;
+                        }
+                    }
+                }
+
+                if (solution_found) break;
+
+                // Stagnation counter logic
+                if (current_e >= local_best_energy) n++;
+                else n = 0;
             }
+            
+            if (solution_found) break;
+
+            k++;
+            if (improved_in_try) k = 0;
         }
-        
-        // Hết nmax bước mà không feasible -> Strike
-        k++;
-        // Nếu trong lần thử vừa rồi có tiến bộ, reset strike để cho thêm cơ hội
-        if (improved_in_try) k = 0; 
-        
-        std::cout << "   Separate step | Energy: " << e_star << " | Strike: " << k << "/" << kmax << std::endl;
-    }
+    } // End Parallel
 
-    items = s_star;
-    return (e_star <= 1e-4);
+    return (best_global_energy <= 1e-4);
 }
 
-// FIX: Hàm Scramble không Swap nữa mà Perturb/Flip
+void SparrowSolver::move_items_multi() {
+    // Deprecated / No-op as logic is moved to separate()
+}
+
 void SparrowSolver::scrambleItems() {
-    // Chọn ngẫu nhiên 20% số lượng vật thể để gây nhiễu
     int count = std::max(1, (int)(items.size() * 0.2));
     std::vector<int> indices(items.size());
     std::iota(indices.begin(), indices.end(), 0);
@@ -508,23 +425,14 @@ void SparrowSolver::scrambleItems() {
 
     for (int i = 0; i < count; ++i) {
         int idx = indices[i];
-        
-        // 1. Dịch chuyển ngẫu nhiên
         Vec2 newPos;
         newPos.x = randomDouble(-halfSize, halfSize);
         newPos.y = randomDouble(-halfSize, halfSize);
-
-        // 2. XOAY/LẬT (Quan trọng)
-        // Thay đổi hoàn toàn trạng thái orientation để phá kẹt
+        
         double currentAngle = items[idx].angle;
         double newAngle;
-        
-        if (randomDouble(0, 1) < 0.5) {
-            newAngle = currentAngle + PI; // Flip 180
-        } else {
-            newAngle = randomDouble(0, 2.0 * PI); // Random mới
-        }
-        // Thêm nhiễu
+        if (randomDouble(0, 1) < 0.5) newAngle = currentAngle + PI;
+        else newAngle = randomDouble(0, 2.0 * PI);
         newAngle += randomDouble(-0.1, 0.1);
 
         items[idx].setTransform(newPos, newAngle);
@@ -535,7 +443,6 @@ void SparrowSolver::scrambleItems() {
 void SparrowSolver::explore() {
     auto start = std::chrono::steady_clock::now();
     
-    // Khởi đầu: Tìm feasible đầu tiên
     if (!separate(config.Kx, config.Nx * 2, config.TLx)) {
         config.container_size *= 1.05;
         initializePlacement(); 
@@ -546,69 +453,45 @@ void SparrowSolver::explore() {
     std::vector<CompositeShape> s_best = items;
 
     int iter = 0;
-    int fail_streak = 0; // Đếm số lần thất bại liên tiếp
-    
-    // Sử dụng current_Rx riêng để có thể thay đổi linh hoạt
+    int fail_streak = 0;
     double current_Rx = config.Rx; 
 
     while (iter < config.max_outer_loops) {
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
         if (elapsed > config.TLx) break;
         
-        // Nếu Rx quá nhỏ (dưới 0.001%), ta coi như đã hội tụ, reset lại để explore vùng khác
         if (current_Rx < 1e-5) {
-             current_Rx = config.Rx; // Reset step size
-             // Có thể scramble nhẹ để đổi gió
+             current_Rx = config.Rx; 
              scrambleItems(); 
         }
 
-        // Lưu trạng thái Feasible tốt nhất hiện tại
         std::vector<CompositeShape> s_prev_feasible = items;
         double size_prev = config.container_size;
 
-        // --- ADAPTIVE SHRINK LOGIC ---
-        // Thu nhỏ thùng chứa
         config.container_size *= (1.0 - current_Rx);
 
         std::cout << "Explore [" << iter << "] | Rx: " << current_Rx 
                   << " | Target: " << config.container_size 
                   << " | Streak: " << fail_streak << std::endl;
 
-        // Scale vị trí các vật vào trong
         double scale = config.container_size / size_prev;
         for(auto& it : items) it.setTransform(it.pos * scale, it.angle);
         
-        // Reset GLS weights
         for(auto& r : weights) std::fill(r.begin(), r.end(), 1.0);
 
-        // Cố gắng giải
-        // Nếu fail streak cao, tăng nỗ lực giải (Nx) lên để cố cứu vãn
         int effective_Nx = config.Nx + (fail_streak * 50);
         bool feasible = separate(config.Kx, effective_Nx, config.TLx - elapsed);
 
         if (feasible) {
-            // THÀNH CÔNG
             best_size = config.container_size;
             s_best = items;
-            
-            // Nếu thành công, ta có thể giữ nguyên Rx hoặc tăng nhẹ để đi nhanh hơn (Momentum)
             fail_streak = 0;
-            // current_Rx = std::min(config.Rx, current_Rx * 1.1); 
         } else {
-            // THẤT BẠI (Infeasible)
             fail_streak++;
-            
-            // Revert về trạng thái tốt nhất trước đó
             items = s_prev_feasible;
             config.container_size = size_prev;
-            
-            // QUAN TRỌNG: Giảm Rx đi một nửa để lần sau thử bước nhỏ hơn
             current_Rx *= 0.5;
-            
-            // Đồng thời Scramble để thay đổi cấu hình, hy vọng cấu hình mới sẽ chịu được mức nén này
-            // Nhưng chỉ Scramble nhẹ thôi (Targeted)
             scrambleItems(); 
-            
             std::cout << "   -> Fail. Revert & Reduce Rx to " << current_Rx << std::endl;
         }
         iter++;
@@ -619,7 +502,6 @@ void SparrowSolver::explore() {
 }
 
 void SparrowSolver::compress(double ratio) {
-    // Tương tự explore nhưng shrink rate nhỏ dần
     auto start = std::chrono::steady_clock::now();
     std::vector<CompositeShape> s_star = items;
     double best_size = config.container_size;
@@ -629,15 +511,13 @@ void SparrowSolver::compress(double ratio) {
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
         if (elapsed > config.TLc) break;
 
-        // Dynamic shrink rate
         double progress = (double)elapsed / config.TLc;
         double r = config.Rs_c + (config.Re_c - config.Rs_c) * progress;
 
-        items = s_star; // Luôn bắt đầu từ feasible
+        items = s_star;
         double old_size = config.container_size;
         config.container_size *= (1.0 - r);
 
-        // Reset Weights
         for(auto& row : weights) std::fill(row.begin(), row.end(), 1.0);
 
         bool feasible = separate(config.Kc, config.Nc, config.TLc - elapsed);
@@ -647,7 +527,7 @@ void SparrowSolver::compress(double ratio) {
             best_size = config.container_size;
              std::cout << "   Compress success -> " << best_size << std::endl;
         } else {
-            config.container_size = old_size; // Revert nếu fail
+            config.container_size = old_size;
              std::cout << "   Compress fail, revert." << std::endl;
         }
         loop_iter++;
@@ -663,12 +543,11 @@ void SparrowSolver::descent() {
 void SparrowSolver::solve() {
     std::cout << ">>> Solver Started. Items: " << items.size() << std::endl;
     
-    // Initial Feasibility check
     int attempts = 0;
     while (!separate(config.Kx, config.Nx * 2, config.TLx) && attempts < 10) {
         std::cout << "[Warn] Initial config infeasible. Expanding..." << std::endl;
         config.container_size *= 1.1;
-        initializePlacement(); // Reset vị trí
+        initializePlacement();
         attempts++;
     }
     
@@ -685,8 +564,6 @@ void SparrowSolver::solve() {
     int maxRestarts = config.max_restart;
     for (int iter = 0; iter < maxRestarts; ++iter) {
         std::cout << "\n=== Major Iteration " << iter << " ===" << std::endl;
-        
-        // 1. Descent (Compress)
         descent();
         
         if (config.container_size < bestSize) {
@@ -695,13 +572,10 @@ void SparrowSolver::solve() {
             std::cout << "   [***] New Record: " << bestSize << std::endl;
         }
 
-        // 2. Explore (Escape local optima)
-        // Load lại best để explore từ đó
         items = bestItems;
         config.container_size = bestSize;
         explore();
         
-        // Cập nhật lại nếu explore tìm được cái tốt hơn
         if (config.container_size < bestSize) {
             bestSize = config.container_size;
             bestItems = items;
@@ -709,7 +583,6 @@ void SparrowSolver::solve() {
         }
     }
 
-    // Final result
     items = bestItems;
     config.container_size = bestSize;
     std::cout << ">>> Final Size: " << std::setprecision(10) << std::fixed << config.container_size << std::endl;
