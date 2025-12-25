@@ -135,8 +135,7 @@ void SparrowSolver::searchPosition(int itemIdx, std::vector<CompositeShape>& loc
     const CompositeShape& current = local_items[itemIdx];
     double current_e = evaluateSample(itemIdx, current.pos, current.angle, local_items, local_weights);
 
-    static thread_local std::vector<std::pair<double, Transform>> candidates;
-    candidates.clear(); // Xóa dữ liệu cũ, nhưng giữ nguyên capacity bộ nhớ
+    std::vector<std::pair<double, Transform>> candidates;
     candidates.reserve(config.n_samples);
 
     double halfSize = config.container_size / 2.0;
@@ -345,12 +344,8 @@ bool SparrowSolver::separate(int kmax, int nmax, double time_limit_sec) {
     #pragma omp parallel
     {
         // 1. Thread-Local State Initialization (Copy from Master)
-        static thread_local std::vector<CompositeShape> local_items;
-        static thread_local std::vector<std::vector<double>> local_weights;
-
-        // Phép gán này sẽ tái sử dụng capacity cũ, không cần malloc lại
-        local_items = items;
-        local_weights = weights;
+        std::vector<CompositeShape> local_items = items;
+        std::vector<std::vector<double>> local_weights = weights;
         
         // 2. Worker Loop
         int k = 0;
