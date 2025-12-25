@@ -134,10 +134,6 @@ private:
     std::vector<CompositeShape> savedItems;
     double savedContainerSize;
 
-    // Hàm cập nhật trọng số GLS trên Master
-    void updateMasterWeights();
-    double getTotalEnergy() const;
-
     // --- Internal Helpers ---
     double randomDouble(double min, double max);
     void saveState();
@@ -184,6 +180,7 @@ public:
     void explore();
 
     // Algorithm 11: Cố gắng co nhỏ sâu nhất có thể từ trạng thái hiện tại
+    void descent();
 
     // Algorithm 10: Hàm giải chính (Outer Loop)
     void solve();
