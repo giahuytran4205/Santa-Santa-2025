@@ -184,7 +184,6 @@ public:
     void explore();
 
     // Algorithm 11: Cố gắng co nhỏ sâu nhất có thể từ trạng thái hiện tại
-    void descent();
 
     // Algorithm 10: Hàm giải chính (Outer Loop)
     void solve();
