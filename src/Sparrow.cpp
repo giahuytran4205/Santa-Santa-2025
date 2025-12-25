@@ -9,214 +9,18 @@
 #include <random>
 #include <iomanip>
 
-SeparatorWorker::SeparatorWorker(int _id, int seed, const std::vector<CompositeShape>& initItems, size_t n) 
-    : id(_id), items(initItems), rng(seed) {
-    weights.resize(n, std::vector<double>(n, 1.0));
-    current_energy = 0.0;
-}
+// --- Helper Functions ---
 
-void SeparatorWorker::load(const std::vector<CompositeShape>& masterItems, const std::vector<std::vector<double>>& masterWeights) {
-    // Tái sử dụng bộ nhớ vector, chỉ copy dữ liệu
-    items = masterItems;
-    weights = masterWeights;
-    // Không cần tính lại energy ngay, sẽ tính sau khi move
-}
-
-double SeparatorWorker::evaluateSample(int itemIdx, Vec2 pos, double angle, const SparrowConfig& config) {
-    CompositeShape tempItem = items[itemIdx];
-    tempItem.setTransform(pos, angle); 
-    
-    double totalCost = 0.0;
-    double halfSize = config.container_size / 2.0;
-
-    // Wall Penalty
-    const AABB& aabb = tempItem.totalAABB;
-    double outOfBounds = 0.0;
-    if (aabb.min.x < -halfSize) outOfBounds += (-halfSize - aabb.min.x);
-    if (aabb.max.x > halfSize)  outOfBounds += (aabb.max.x - halfSize);
-    if (aabb.min.y < -halfSize) outOfBounds += (-halfSize - aabb.min.y);
-    if (aabb.max.y > halfSize)  outOfBounds += (aabb.max.y - halfSize);
-    
-    if (outOfBounds > 0) {
-        totalCost += (outOfBounds * 100.0) + (outOfBounds * outOfBounds * 1000.0);
-    }
-
-    // Overlap
-    for (size_t j = 0; j < items.size(); ++j) {
-        if ((int)j == itemIdx) continue;
-        if (tempItem.totalAABB.overlaps(items[j].totalAABB)) {
-             double overlap = quantify_collision(tempItem, items[j]);
-             if (overlap > 1e-9) {
-                 totalCost += overlap * weights[itemIdx][j];
-             }
-        }
-    }
-    return totalCost;
-}
-
-void SeparatorWorker::searchPosition(int itemIdx, const SparrowConfig& config) {
-    const CompositeShape& current = items[itemIdx];
-    double current_e = evaluateSample(itemIdx, current.pos, current.angle, config);
-
-    // Static thread_local để tái sử dụng memory cho candidates trong luồng này
-    static thread_local std::vector<std::pair<double, Transform>> candidates;
-    candidates.clear();
-    candidates.reserve(config.n_samples);
-
-    double halfSize = config.container_size / 2.0;
-    double foc_radius = config.container_size * 0.15;
-    
-    std::uniform_real_distribution<double> dist01(0.0, 1.0);
-    std::uniform_real_distribution<double> distContainer(-halfSize, halfSize);
-    std::uniform_real_distribution<double> distFoc(-foc_radius, foc_radius);
-    std::uniform_real_distribution<double> distAngle(0.0, 2.0 * PI);
-    std::uniform_real_distribution<double> distJitter(-0.02, 0.02);
-
-    int n_div = (int)(config.n_samples * 0.4);
-    int n_foc = (int)(config.n_samples * 0.4);
-    int n_flip = config.n_samples - n_div - n_foc;
-
-    // Phase 1: Global
-    for (int s = 0; s < n_div; ++s) {
-        double x = distContainer(rng);
-        double y = distContainer(rng);
-        double rot = (dist01(rng) < 0.5) ? 0.0 : PI; 
-        rot += distJitter(rng);
-        candidates.emplace_back(evaluateSample(itemIdx, {x, y}, rot, config), Transform({x, y}, rot));
-    }
-
-    // Phase 2: Local
-    for (int s = 0; s < n_foc; ++s) {
-        double x = current.pos.x + distFoc(rng);
-        double y = current.pos.y + distFoc(rng);
-        double rot = current.angle + distJitter(rng);
-        candidates.emplace_back(evaluateSample(itemIdx, {x, y}, rot, config), Transform({x, y}, rot));
-    }
-
-    // Phase 3: Flip
-    for (int s = 0; s < n_flip; ++s) {
-        double x = current.pos.x + distFoc(rng);
-        double y = current.pos.y + distFoc(rng);
-        double rot = current.angle + PI + distJitter(rng);
-        while (rot > 2*PI) rot -= 2*PI;
-        candidates.emplace_back(evaluateSample(itemIdx, {x, y}, rot, config), Transform({x, y}, rot));
-    }
-
-    // Sort & Pick Best
-    std::sort(candidates.begin(), candidates.end());
-
-    // Coordinate Descent (Local Refinement)
-    int K = 3; 
-    Transform best_t(current.pos, current.angle);
-    double best_e = current_e;
-
-    for (int i = 0; i < std::min(K, (int)candidates.size()); ++i) {
-        Transform t = candidates[i].second;
-        double e = candidates[i].first;
-        if (e > current_e * 1.5) continue;
-
-        double step = foc_radius * 0.5;
-        double rot_step = 0.05; 
-        
-        for (int iter = 0; iter < 10; ++iter) { 
-             bool improved = false;
-             for (double d : {-step, step}) {
-                 double ne = evaluateSample(itemIdx, t.pos + Vec2{d,0}, t.angle, config);
-                 if (ne < e) { t.pos.x += d; e = ne; improved = true; }
-             }
-             for (double d : {-step, step}) {
-                 double ne = evaluateSample(itemIdx, t.pos + Vec2{0,d}, t.angle, config);
-                 if (ne < e) { t.pos.y += d; e = ne; improved = true; }
-             }
-             for (double d : {-rot_step, rot_step}) {
-                 double ne = evaluateSample(itemIdx, t.pos, t.angle + d, config);
-                 if (ne < e) { t.angle += d; e = ne; improved = true; }
-             }
-             if (!improved) { step *= 0.5; rot_step *= 0.5; }
-             if (step < 1e-4) break;
-        }
-        if (e < best_e) { best_e = e; best_t = t; }
-    }
-
-    if (best_e < current_e) {
-        items[itemIdx].setTransform(best_t.pos, best_t.angle);
-    }
-}
-
-double SeparatorWorker::calculate_total_energy(const SparrowConfig& config) {
-    double energy = 0.0;
-    double halfSize = config.container_size / 2.0;
-
-    for (size_t i = 0; i < items.size(); ++i) {
-        const AABB& aabb = items[i].totalAABB;
-        double outOfBounds = 0.0;
-        if (aabb.min.x < -halfSize) outOfBounds += (-halfSize - aabb.min.x);
-        if (aabb.max.x > halfSize)  outOfBounds += (aabb.max.x - halfSize);
-        if (aabb.min.y < -halfSize) outOfBounds += (-halfSize - aabb.min.y);
-        if (aabb.max.y > halfSize)  outOfBounds += (aabb.max.y - halfSize);
-        if (outOfBounds > 0) {
-            energy += (outOfBounds * 100.0) + (outOfBounds * outOfBounds * 1000.0);
-        }
-
-        for (size_t j = i + 1; j < items.size(); ++j) {
-            if (items[i].totalAABB.overlaps(items[j].totalAABB)) {
-                energy += quantify_collision(items[i], items[j]);
-            }
-        }
-    }
-    return energy;
-}
-
-void SeparatorWorker::move_items(const SparrowConfig& config) {
-    // 1. Identify Colliding Items
-    std::vector<int> Ic;
-    double halfSize = config.container_size / 2.0;
-    
-    for (int i = 0; i < (int)items.size(); ++i) {
-        bool colliding = false;
-        const AABB& aabb = items[i].totalAABB;
-        if (aabb.min.x < -halfSize || aabb.max.x > halfSize || 
-            aabb.min.y < -halfSize || aabb.max.y > halfSize) {
-            colliding = true;
-        } else {
-            for (int j = 0; j < (int)items.size(); ++j) {
-                if (i == j) continue;
-                if (items[i].totalAABB.overlaps(items[j].totalAABB)) {
-                    if (quantify_collision(items[i], items[j]) > 1e-9) {
-                        colliding = true; break;
-                    }
-                }
-            }
-        }
-        if (colliding) Ic.push_back(i);
-    }
-
-    if (Ic.empty()) {
-        current_energy = 0.0;
-        return;
-    }
-
-    // Shuffle items to move
-    std::shuffle(Ic.begin(), Ic.end(), rng);
-
-    // Try to move colliding items
-    for (int idx : Ic) {
-        searchPosition(idx, config);
-    }
-
-    // Recalculate energy after moves
-    current_energy = calculate_total_energy(config);
-}
-
-
-// ==========================================
-// SPARROW SOLVER IMPLEMENTATION
-// ==========================================
-
-// Helper
+// Thread-Safe Random Helper
 double SparrowSolver::randomDouble(double min, double max) {
+    static thread_local std::mt19937* local_rng = nullptr;
+    if (!local_rng) {
+        // Seed based on time and thread ID to ensure independence
+        unsigned int seed = (unsigned int)(std::chrono::system_clock::now().time_since_epoch().count() + omp_get_thread_num());
+        local_rng = new std::mt19937(seed);
+    }
     std::uniform_real_distribution<double> dist(min, max);
-    return dist(rng);
+    return dist(*local_rng);
 }
 
 void SparrowSolver::saveState() {
@@ -229,13 +33,13 @@ void SparrowSolver::loadState() {
     config.container_size = savedContainerSize;
 }
 
-// Hàm khởi tạo cũ (Giữ nguyên logic)
 void SparrowSolver::initializePlacement() {
     double halfSize = config.container_size / 2.0;
     int n = items.size();
     int rows = std::ceil(std::sqrt(n));
     double spacing = config.container_size / rows;
     int idx = 0;
+    
     std::vector<int> indices(n);
     std::iota(indices.begin(), indices.end(), 0);
     std::shuffle(indices.begin(), indices.end(), rng);
@@ -245,74 +49,221 @@ void SparrowSolver::initializePlacement() {
             int itemIdx = indices[idx];
             double x = -halfSize + spacing * (c + 0.5);
             double y = -halfSize + spacing * (r + 0.5);
-            double rot = ((r + c) % 2 == 0) ? 0.0 : PI; 
+            
+            // Chessboard heuristic
+            double rot = ((r + c) % 2 == 0) ? 0.0 : PI;
+            
             rot += randomDouble(-0.1, 0.1); 
             double jitter = spacing * 0.1;
             x += randomDouble(-jitter, jitter);
             y += randomDouble(-jitter, jitter);
+
             items[itemIdx].setTransform({x, y}, rot);
             idx++;
         }
     }
+    std::cout << "Initialized placement (Chessboard heuristic), initial energy: " << getTotalEnergy() << std::endl;
 }
 
 SparrowSolver::SparrowSolver(const std::vector<CompositeShape>& inputItems, SparrowConfig cfg) 
     : items(inputItems), config(cfg) {
-
-    // 1. Config Threads
-    if (config.n_threads <= 0) {
-        config.n_threads = omp_get_num_procs();
+        
+    if (config.n_threads > 0) {
+        omp_set_num_threads(config.n_threads);
+    } else {
+        omp_set_num_threads(omp_get_num_procs());
     }
-    omp_set_num_threads(config.n_threads);
 
+    #pragma omp parallel
+    {
+        #pragma omp single
+        {
+            std::cout << ">>> OpenMP Optimized Solver Running with " << omp_get_num_threads() << " threads." << std::endl;
+        }
+    }
+    
     std::random_device rd;
     rng = std::mt19937(rd());
 
-    // 2. Init Weights
     size_t n = items.size();
     weights.resize(n, std::vector<double>(n, 1.0));
-    for (auto& item : items) item.precomputeAllPoles(0.01);
-    
-    initializePlacement();
 
-    // 3. CREATE PERSISTENT WORKERS
-    workers.reserve(config.n_threads);
-    for (int i = 0; i < config.n_threads; ++i) {
-        // Mỗi worker có seed riêng để chạy độc lập
-        workers.emplace_back(i, rd() + i, items, n);
+    // Precompute poles
+    for (auto& item : items) {
+        item.precomputeAllPoles(0.01); 
     }
-    
-    std::cout << ">>> Solver Initialized with " << config.n_threads << " persistent workers." << std::endl;
+
+    initializePlacement();
 }
 
-double SparrowSolver::getTotalEnergy() const {
-    // Tính toán trên Master
-    double energy = 0.0;
+// Algorithm 7: Evaluate Sample
+double SparrowSolver::evaluateSample(int itemIdx, Vec2 pos, double angle, const std::vector<CompositeShape>& local_items, const std::vector<std::vector<double>>& local_weights) const {
+    CompositeShape tempItem = local_items[itemIdx];
+    tempItem.setTransform(pos, angle); 
+
+    double totalCost = 0.0;
     double halfSize = config.container_size / 2.0;
-    for (size_t i = 0; i < items.size(); ++i) {
-        const AABB& aabb = items[i].totalAABB;
+
+    // 1. Wall Penalty
+    const AABB& aabb = tempItem.totalAABB;
+    double outOfBounds = 0.0;
+    if (aabb.min.x < -halfSize) outOfBounds += (-halfSize - aabb.min.x);
+    if (aabb.max.x > halfSize)  outOfBounds += (aabb.max.x - halfSize);
+    if (aabb.min.y < -halfSize) outOfBounds += (-halfSize - aabb.min.y);
+    if (aabb.max.y > halfSize)  outOfBounds += (aabb.max.y - halfSize);
+    
+    if (outOfBounds > 0) {
+        totalCost += (outOfBounds * 100.0) + (outOfBounds * outOfBounds * 1000.0);
+    }
+
+    // 2. Item Overlap
+    for (size_t j = 0; j < local_items.size(); ++j) {
+        if (static_cast<int>(j) == itemIdx) continue;
+        
+        if (tempItem.totalAABB.overlaps(local_items[j].totalAABB)) {
+             double overlap = quantify_collision(tempItem, local_items[j]);
+             if (overlap > 1e-9) {
+                 totalCost += overlap * local_weights[itemIdx][j];
+             }
+        }
+    }
+    return totalCost;
+}
+
+// --- OPTIMIZED SEARCH: Sequential logic (called by parallel workers) ---
+void SparrowSolver::searchPosition(int itemIdx, std::vector<CompositeShape>& local_items, std::vector<std::vector<double>>& local_weights) {
+    const CompositeShape& current = local_items[itemIdx];
+    double current_e = evaluateSample(itemIdx, current.pos, current.angle, local_items, local_weights);
+
+    std::vector<std::pair<double, Transform>> candidates;
+    candidates.reserve(config.n_samples);
+
+    double halfSize = config.container_size / 2.0;
+    double foc_radius = config.container_size * 0.15;
+    
+    int n_div = (int)(config.n_samples * 0.4);
+    int n_foc = (int)(config.n_samples * 0.4);
+    int n_flip = config.n_samples - n_div - n_foc;
+
+    // Phase 1: Global
+    for (int s = 0; s < n_div; ++s) {
+        double x = randomDouble(-halfSize, halfSize);
+        double y = randomDouble(-halfSize, halfSize);
+        double rot = ((int)(randomDouble(0, 100)) % 2 == 0) ? 0.0 : PI;
+        rot += randomDouble(-0.01, 0.01);
+        double e = evaluateSample(itemIdx, {x, y}, rot, local_items, local_weights);
+        candidates.emplace_back(e, Transform({x, y}, rot));
+    }
+
+    // Phase 2: Local
+    for (int s = 0; s < n_foc; ++s) {
+        double dx = randomDouble(-foc_radius, foc_radius);
+        double dy = randomDouble(-foc_radius, foc_radius);
+        double rot = current.angle + randomDouble(-0.02, 0.02);
+        double e = evaluateSample(itemIdx, current.pos + Vec2{dx, dy}, rot, local_items, local_weights);
+        candidates.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, rot));
+    }
+
+    // Phase 3: Flip
+    for (int s = 0; s < n_flip; ++s) {
+        double dx = randomDouble(-foc_radius, foc_radius);
+        double dy = randomDouble(-foc_radius, foc_radius);
+        double rot = current.angle + PI + randomDouble(-0.01, 0.01);
+        while (rot > 2 * PI) rot -= 2 * PI;
+        double e = evaluateSample(itemIdx, current.pos + Vec2{dx, dy}, rot, local_items, local_weights);
+        candidates.emplace_back(e, Transform(current.pos + Vec2{dx, dy}, rot));
+    }
+
+    // Sort best candidates
+    std::sort(candidates.begin(), candidates.end());
+
+    // Coordinate Descent on top K candidates
+    int K = 3; 
+    Transform best_t(current.pos, current.angle);
+    double best_e = current_e;
+
+    for (int i = 0; i < std::min(K, (int)candidates.size()); ++i) {
+        Transform t = candidates[i].second;
+        double e = candidates[i].first;
+        if (e > current_e * 1.5) continue;
+
+        double step = foc_radius * 0.5;
+        double rot_step = 0.05; 
+        
+        for (int iter = 0; iter < 20; ++iter) { 
+             bool improved = false;
+             // X
+             for (double d : {-step, step}) {
+                 double ne = evaluateSample(itemIdx, t.pos + Vec2{d,0}, t.angle, local_items, local_weights);
+                 if (ne < e) { t.pos.x += d; e = ne; improved = true; }
+             }
+             // Y
+             for (double d : {-step, step}) {
+                 double ne = evaluateSample(itemIdx, t.pos + Vec2{0,d}, t.angle, local_items, local_weights);
+                 if (ne < e) { t.pos.y += d; e = ne; improved = true; }
+             }
+             // Angle
+             for (double d : {-rot_step, rot_step}) {
+                 double ne = evaluateSample(itemIdx, t.pos, t.angle + d, local_items, local_weights);
+                 if (ne < e) { t.angle += d; e = ne; improved = true; }
+             }
+             if (!improved) { step *= 0.5; rot_step *= 0.5; }
+             if (step < 1e-4) break;
+        }
+
+        if (e < best_e) { best_e = e; best_t = t; }
+    }
+
+    if (best_e < current_e) {
+        local_items[itemIdx].setTransform(best_t.pos, best_t.angle);
+    }
+}
+
+double SparrowSolver::getTotalEnergy() {
+    return calculate_energy(items);
+}
+
+double SparrowSolver::calculate_energy(const std::vector<CompositeShape>& local_items) const {
+    double energy = 0.0;
+    
+    // Item-Item Overlap
+    for (size_t a = 0; a < local_items.size(); ++a) {
+        for (size_t b = a + 1; b < local_items.size(); ++b) {
+            if (local_items[a].totalAABB.overlaps(local_items[b].totalAABB)) {
+                energy += quantify_collision(local_items[a], local_items[b]);
+            }
+        }
+    }
+    
+    // Wall Penalty
+    double halfSize = config.container_size / 2.0;
+    for (const auto& item : local_items) {
+        const AABB& aabb = item.totalAABB;
         double outOfBounds = 0.0;
         if (aabb.min.x < -halfSize) outOfBounds += (-halfSize - aabb.min.x);
         if (aabb.max.x > halfSize)  outOfBounds += (aabb.max.x - halfSize);
         if (aabb.min.y < -halfSize) outOfBounds += (-halfSize - aabb.min.y);
         if (aabb.max.y > halfSize)  outOfBounds += (aabb.max.y - halfSize);
-        if (outOfBounds > 0) energy += (outOfBounds * 100.0) + (outOfBounds * outOfBounds * 1000.0);
-        for (size_t j = i + 1; j < items.size(); ++j) {
-            if (items[i].totalAABB.overlaps(items[j].totalAABB)) {
-                energy += quantify_collision(items[i], items[j]);
-            }
+        
+        if (outOfBounds > 0) {
+            energy += (outOfBounds * 100.0) + (outOfBounds * outOfBounds * 1000.0);
         }
     }
     return energy;
 }
 
-void SparrowSolver::updateMasterWeights() {
+void SparrowSolver::updateWeights(std::vector<std::vector<double>>& local_weights) {
+    // This is a placeholder for the class method, but we use the helper below in parallel.
+}
+
+// Helper to update weights inside worker
+void updateLocalWeights(std::vector<std::vector<double>>& w, const std::vector<CompositeShape>& it, const SparrowConfig& cfg) {
     double e_max = 0.0;
-    size_t n = items.size();
+    size_t n = it.size();
     for (size_t a = 0; a < n; ++a) {
         for (size_t b = a + 1; b < n; ++b) {
-            if (items[a].totalAABB.overlaps(items[b].totalAABB)) {
-                double e = quantify_collision(items[a], items[b]);
+            if (it[a].totalAABB.overlaps(it[b].totalAABB)) {
+                double e = quantify_collision(it[a], it[b]);
                 if (e > e_max) e_max = e;
             }
         }
@@ -323,87 +274,143 @@ void SparrowSolver::updateMasterWeights() {
     for (size_t a = 0; a < n; ++a) {
         for (size_t b = a + 1; b < n; ++b) {
             double e = 0.0;
-            if (items[a].totalAABB.overlaps(items[b].totalAABB)) {
-                e = quantify_collision(items[a], items[b]);
+            if (it[a].totalAABB.overlaps(it[b].totalAABB)) {
+                e = quantify_collision(it[a], it[b]);
             }
-            double m = (e > 1e-9) ? (config.Ml + (config.Mu - config.Ml) * (e / e_max)) : config.Md;
-            weights[a][b] = std::max(1.0, weights[a][b] * m);
-            weights[b][a] = weights[a][b]; 
+            
+            double m;
+            if (e > 1e-9) m = cfg.Ml + (cfg.Mu - cfg.Ml) * (e / e_max);
+            else m = cfg.Md;
+            
+            w[a][b] = std::max(1.0, w[a][b] * m);
+            w[b][a] = w[a][b]; 
         }
     }
 }
 
-// === ALGORITHM 9: SEPARATE (REFACTORED LIKE RUST) ===
+void SparrowSolver::perform_move_items(std::vector<CompositeShape>& local_items, std::vector<std::vector<double>>& local_weights) {
+    std::vector<int> Ic;
+    double halfSize = config.container_size / 2.0;
+    
+    // Identify Colliding Items
+    for (int i = 0; i < local_items.size(); ++i) {
+        bool colliding = false;
+        const AABB& aabb = local_items[i].totalAABB;
+        
+        if (aabb.min.x < -halfSize || aabb.max.x > halfSize || aabb.min.y < -halfSize || aabb.max.y > halfSize) {
+            colliding = true;
+        } else {
+            for (int j = 0; j < local_items.size(); ++j) {
+                if (i == j) continue;
+                if (local_items[i].totalAABB.overlaps(local_items[j].totalAABB)) {
+                    if (quantify_collision(local_items[i], local_items[j]) > 1e-6) {
+                        colliding = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (colliding) Ic.push_back(i);
+    }
+
+    if (Ic.empty()) return;
+
+    // --- FIX: Use correct thread-local RNG ---
+    static thread_local std::mt19937* local_rng_ptr = nullptr;
+    if(!local_rng_ptr) {
+         unsigned int seed = (unsigned int)(std::chrono::system_clock::now().time_since_epoch().count() + omp_get_thread_num());
+         local_rng_ptr = new std::mt19937(seed);
+    }
+    std::shuffle(Ic.begin(), Ic.end(), *local_rng_ptr);
+
+    for (int i : Ic) {
+        searchPosition(i, local_items, local_weights);
+    }
+}
+
+// --- CORE PARALLEL OPTIMIZATION ---
 bool SparrowSolver::separate(int kmax, int nmax, std::chrono::steady_clock::time_point deadline) {
+    
+    // Initial best state
     double best_global_energy = getTotalEnergy();
-    if (best_global_energy <= 1e-5) return true;
+    if (best_global_energy <= 1e-4) return true;
+
+    // Check timeout ngay từ đầu phòng trường hợp vừa vào đã hết giờ
     if (std::chrono::steady_clock::now() > deadline) return false;
 
-    int k = 0;
-    while (k < kmax) {
-        int n = 0;
-        bool improved_in_try = false;
+    bool solution_found = false;
 
-        while (n < nmax) {
-            if (std::chrono::steady_clock::now() > deadline) return false;
+    #pragma omp parallel
+    {
+        // Thread-Local State Initialization
+        static thread_local std::vector<CompositeShape> local_items;
+        static thread_local std::vector<std::vector<double>> local_weights;
+        local_items = items;
+        local_weights = weights;
+        
+        int k = 0;
+        while (k < kmax && !solution_found) {
+            
+            int n = 0;
+            bool improved_in_try = false;
+            double local_best_energy = calculate_energy(local_items);
 
-            // 1. SYNC & PARALLEL EXECUTION (Fork-Join)
-            // Không có critical section bên trong vòng lặp của Worker!
-            #pragma omp parallel for
-            for (int i = 0; i < (int)workers.size(); ++i) {
-                // Load Master State
-                workers[i].load(items, weights);
-                // Worker tự chạy logic di chuyển của riêng mình
-                workers[i].move_items(config);
-            }
-
-            // 2. GATHER RESULT (Master Thread)
-            int best_worker_idx = -1;
-            double min_worker_energy = std::numeric_limits<double>::max();
-
-            for (int i = 0; i < (int)workers.size(); ++i) {
-                if (workers[i].current_energy < min_worker_energy) {
-                    min_worker_energy = workers[i].current_energy;
-                    best_worker_idx = i;
+            while (n < nmax) {
+                // [SỬA ĐỔI] Kiểm tra Deadline mỗi 10 bước
+                if (n % 10 == 0) {
+                    if (solution_found) break;
+                    // So sánh trực tiếp với deadline
+                    if (std::chrono::steady_clock::now() > deadline) break;
                 }
-            }
 
-            // 3. UPDATE MASTER STATE
-            if (best_worker_idx != -1) {
-                // Cập nhật Master theo worker giỏi nhất
-                items = workers[best_worker_idx].items;
-                // Lưu ý: Rust update weights ở bước sau, không copy weights từ worker về
-                
-                if (min_worker_energy < best_global_energy) {
-                    best_global_energy = min_worker_energy;
+                perform_move_items(local_items, local_weights);
+                updateLocalWeights(local_weights, local_items, config);
+
+                double current_e = calculate_energy(local_items);
+
+                if (current_e < local_best_energy) {
+                    local_best_energy = current_e;
                     improved_in_try = true;
                 }
+
+                if (current_e < best_global_energy) {
+                    #pragma omp critical
+                    {
+                        if (current_e < best_global_energy) {
+                            best_global_energy = current_e;
+                            items = local_items;
+                            weights = local_weights;
+                            // std::cout << "   [Worker " << omp_get_thread_num() << "] New Best Energy: " << best_global_energy << std::endl;
+                        }
+                        if (best_global_energy <= 1e-4) {
+                            solution_found = true;
+                        }
+                    }
+                }
+
+                if (solution_found) break;
+
+                if (current_e >= local_best_energy) n++;
+                else n = 0;
             }
+            
+            // Nếu hết giờ thì thoát luôn cả vòng lặp ngoài
+            if (std::chrono::steady_clock::now() > deadline) break;
+            if (solution_found) break;
 
-            if (best_global_energy <= 1e-5) return true;
-
-            // 4. UPDATE WEIGHTS (Algorithm 8)
-            // Chỉ Master làm việc này 1 lần sau mỗi bước sync
-            updateMasterWeights();
-
-            // Stagnation logic
-            if (min_worker_energy < best_global_energy * 0.999) { // Có cải thiện đáng kể
-                n = 0;
-            } else {
-                n++;
-            }
+            k++;
+            if (improved_in_try) k = 0;
         }
-        
-        k++;
-        if (improved_in_try) k = 0; // Nếu strike này có tiến bộ, reset strike
-    }
+    } 
 
-    return (best_global_energy <= 1e-5);
+    return (best_global_energy <= 1e-4);
 }
 
-// Scramble logic cũng cần cập nhật
+void SparrowSolver::move_items_multi() {
+    // Deprecated / No-op as logic is moved to separate()
+}
+
 void SparrowSolver::scrambleItems() {
-    // ... Logic giống cũ nhưng thực hiện trên Master items ...
     int count = std::max(1, (int)(items.size() * 0.2));
     std::vector<int> indices(items.size());
     std::iota(indices.begin(), indices.end(), 0);
@@ -413,22 +420,30 @@ void SparrowSolver::scrambleItems() {
 
     for (int i = 0; i < count; ++i) {
         int idx = indices[i];
-        items[idx].setTransform(
-            {randomDouble(-halfSize, halfSize), randomDouble(-halfSize, halfSize)},
-            (randomDouble(0,1) < 0.5) ? (items[idx].angle + PI) : randomDouble(0, 2*PI)
-        );
+        Vec2 newPos;
+        newPos.x = randomDouble(-halfSize, halfSize);
+        newPos.y = randomDouble(-halfSize, halfSize);
+        
+        double currentAngle = items[idx].angle;
+        double newAngle;
+        if (randomDouble(0, 1) < 0.5) newAngle = currentAngle + PI;
+        else newAngle = randomDouble(0, 2.0 * PI);
+        newAngle += randomDouble(-0.1, 0.1);
+
+        items[idx].setTransform(newPos, newAngle);
     }
+    std::cout << "   [Scramble] Perturbed " << count << " items." << std::endl;
 }
 
-// Các hàm explore, compress, descent, solve giữ nguyên logic điều khiển luồng (Flow Control)
-// nhưng gọi separate() mới.
-// ... (Copy lại logic explore/compress/solve từ code trước của bạn) ...
 void SparrowSolver::explore() {
+    // [SỬA ĐỔI] Thiết lập Deadline cho toàn bộ Phase Explore
     auto start_time = std::chrono::steady_clock::now();
     auto deadline = start_time + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(config.TLx));
     
+    // Initial check (truyền deadline vào)
     if (!separate(config.Kx, config.Nx * 2, deadline)) {
-        if (std::chrono::steady_clock::now() > deadline) return;
+        if (std::chrono::steady_clock::now() > deadline) return; // Hết giờ thì dừng
+
         config.container_size *= 1.05;
         initializePlacement(); 
         separate(config.Kx, config.Nx * 2, deadline);
@@ -442,30 +457,45 @@ void SparrowSolver::explore() {
     double current_Rx = config.Rx; 
 
     while (iter < config.max_outer_loops) {
+        // [SỬA ĐỔI] Kiểm tra deadline ở vòng lặp ngoài
         if (std::chrono::steady_clock::now() > deadline) break;
         
-        if (current_Rx < 1e-5) { current_Rx = config.Rx; scrambleItems(); }
+        if (current_Rx < 1e-5) {
+             current_Rx = config.Rx; 
+             scrambleItems(); 
+        }
 
         std::vector<CompositeShape> s_prev_feasible = items;
         double size_prev = config.container_size;
 
         config.container_size *= (1.0 - current_Rx);
-        std::cout << "Explore [" << iter << "] | Rx: " << current_Rx << " | Target: " << config.container_size << std::endl;
+
+        std::cout << "Explore [" << iter << "] | Rx: " << current_Rx 
+                  << " | Target: " << config.container_size 
+                  << " | Streak: " << fail_streak << std::endl;
 
         double scale = config.container_size / size_prev;
         for(auto& it : items) it.setTransform(it.pos * scale, it.angle);
-        for(auto& r : weights) std::fill(r.begin(), r.end(), 1.0); // Reset weights
+        
+        for(auto& r : weights) std::fill(r.begin(), r.end(), 1.0);
 
-        bool feasible = separate(config.Kx, config.Nx + (fail_streak*50), deadline);
+        int effective_Nx = config.Nx + (fail_streak * 50);
+        
+        // [SỬA ĐỔI] Gọi separate với deadline chung của phase
+        bool feasible = separate(config.Kx, effective_Nx, deadline);
 
         if (feasible) {
             best_size = config.container_size;
             s_best = items;
             fail_streak = 0;
         } else {
+            // Kiểm tra xem fail do hết giờ hay do không tìm thấy
             if (std::chrono::steady_clock::now() > deadline) {
-                items = s_prev_feasible; config.container_size = size_prev; break;
+                items = s_prev_feasible; // Revert an toàn trước khi thoát
+                config.container_size = size_prev;
+                break;
             }
+
             fail_streak++;
             items = s_prev_feasible;
             config.container_size = size_prev;
@@ -475,66 +505,111 @@ void SparrowSolver::explore() {
         }
         iter++;
     }
+
     items = s_best;
     config.container_size = best_size;
 }
 
 void SparrowSolver::compress(double ratio) {
-    // Logic compress giữ nguyên, chỉ đảm bảo gọi separate mới
+    // [SỬA ĐỔI] Thiết lập Deadline cho toàn bộ Phase Compress
     auto start_time = std::chrono::steady_clock::now();
     auto deadline = start_time + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(config.TLc));
+
     std::vector<CompositeShape> s_star = items;
     double best_size = config.container_size;
     
     int loop_iter = 0;
     while (loop_iter < config.max_outer_loops) {
+        // Kiểm tra deadline
         if (std::chrono::steady_clock::now() > deadline) break;
+
+        // Tính progress dựa trên thời gian đã trôi qua thực tế
         std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start_time;
         double progress = elapsed.count() / config.TLc;
         if (progress > 1.0) progress = 1.0;
+
         double r = config.Rs_c + (config.Re_c - config.Rs_c) * progress;
 
         items = s_star;
         double old_size = config.container_size;
         config.container_size *= (1.0 - r);
+
         for(auto& row : weights) std::fill(row.begin(), row.end(), 1.0);
 
-        if (separate(config.Kc, config.Nc, deadline)) {
-            s_star = items; best_size = config.container_size;
-            std::cout << "   Compress success -> " << best_size << std::endl;
+        // Gọi separate với deadline
+        bool feasible = separate(config.Kc, config.Nc, deadline);
+
+        if (feasible) {
+            s_star = items;
+            best_size = config.container_size;
+             std::cout << "   Compress success -> " << best_size << std::endl;
         } else {
             config.container_size = old_size;
-            std::cout << "   Compress fail." << std::endl;
+            // Nếu hết giờ thì break luôn, không in fail revert thừa
+            if (std::chrono::steady_clock::now() > deadline) {
+                 std::cout << "   Compress timeout." << std::endl;
+                 break;
+            }
+            std::cout << "   Compress fail, revert." << std::endl;
         }
         loop_iter++;
     }
-    items = s_star; config.container_size = best_size;
+    items = s_star;
+    config.container_size = best_size;
 }
 
-void SparrowSolver::descent() { compress(0.0); }
+void SparrowSolver::descent() {
+    compress(0.0);
+}
 
 void SparrowSolver::solve() {
-    // Logic solve giữ nguyên
     std::cout << ">>> Solver Started. Items: " << items.size() << std::endl;
+    
     int attempts = 0;
     while (attempts < 10) {
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(config.TLx));
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(5));
+        
         if (separate(config.Kx, config.Nx * 2, deadline)) break;
-        config.container_size *= 1.1; initializePlacement(); attempts++;
+
+        std::cout << "[Warn] Initial config infeasible. Expanding..." << std::endl;
+        config.container_size *= 1.1;
+        initializePlacement();
+        attempts++;
     }
-    if (attempts >= 10) return;
+    
+    if (attempts >= 10) {
+        std::cout << "[Error] Could not find initial feasible solution." << std::endl;
+        return;
+    }
+
+    std::cout << ">>> Initial Feasible Found: " << config.container_size << std::endl;
 
     double bestSize = config.container_size;
     std::vector<CompositeShape> bestItems = items;
     
-    for (int iter = 0; iter < config.max_restart; ++iter) {
+    int maxRestarts = config.max_restart;
+    for (int iter = 0; iter < maxRestarts; ++iter) {
         std::cout << "\n=== Major Iteration " << iter << " ===" << std::endl;
         descent();
-        if (config.container_size < bestSize) { bestSize = config.container_size; bestItems = items; }
-        items = bestItems; config.container_size = bestSize;
+        
+        if (config.container_size < bestSize) {
+            bestSize = config.container_size;
+            bestItems = items;
+            std::cout << "   [***] New Record: " << bestSize << std::endl;
+        }
+
+        items = bestItems;
+        config.container_size = bestSize;
         explore();
-        if (config.container_size < bestSize) { bestSize = config.container_size; bestItems = items; }
+        
+        if (config.container_size < bestSize) {
+            bestSize = config.container_size;
+            bestItems = items;
+            std::cout << "   [***] Explore found better: " << bestSize << std::endl;
+        }
     }
-    items = bestItems; config.container_size = bestSize;
+
+    items = bestItems;
+    config.container_size = bestSize;
     std::cout << ">>> Final Size: " << std::setprecision(10) << std::fixed << config.container_size << std::endl;
 }
