@@ -1,13 +1,13 @@
 # Sparrow Configuration File
 container_size = 1.1
-n_samples = 64
+n_samples = 4096
 n_threads = -1
 Nc = 200
-Nx = 100
+Nx = 50
 Kc = 5
 Kx = 3
 TLx = 60
-TLc = 60
+TLc = 30
 Rx = 0.005
 Rs_c = 0.005
 Re_c = 0.0001
