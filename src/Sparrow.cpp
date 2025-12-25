@@ -329,25 +329,25 @@ void SparrowSolver::perform_move_items(std::vector<CompositeShape>& local_items,
 }
 
 // --- CORE PARALLEL OPTIMIZATION ---
-bool SparrowSolver::separate(int kmax, int nmax, double time_limit_sec) {
-    auto start = std::chrono::steady_clock::now();
+bool SparrowSolver::separate(int kmax, int nmax, std::chrono::steady_clock::time_point deadline) {
     
     // Initial best state
     double best_global_energy = getTotalEnergy();
     if (best_global_energy <= 1e-4) return true;
 
-    // Flag to stop early if feasible solution found
+    // Check timeout ngay từ đầu phòng trường hợp vừa vào đã hết giờ
+    if (std::chrono::steady_clock::now() > deadline) return false;
+
     bool solution_found = false;
 
-    // Start Parallel Region
-    // Each thread becomes an independent worker (Walker)
     #pragma omp parallel
     {
-        // 1. Thread-Local State Initialization (Copy from Master)
-        std::vector<CompositeShape> local_items = items;
-        std::vector<std::vector<double>> local_weights = weights;
+        // Thread-Local State Initialization
+        static thread_local std::vector<CompositeShape> local_items;
+        static thread_local std::vector<std::vector<double>> local_weights;
+        local_items = items;
+        local_weights = weights;
         
-        // 2. Worker Loop
         int k = 0;
         while (k < kmax && !solution_found) {
             
@@ -356,37 +356,31 @@ bool SparrowSolver::separate(int kmax, int nmax, double time_limit_sec) {
             double local_best_energy = calculate_energy(local_items);
 
             while (n < nmax) {
-                // Check time limit periodically
+                // [SỬA ĐỔI] Kiểm tra Deadline mỗi 10 bước
                 if (n % 10 == 0) {
-                    if (solution_found) break; // Break inner loop
-                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
-                    if (elapsed > time_limit_sec) break;
+                    if (solution_found) break;
+                    // So sánh trực tiếp với deadline
+                    if (std::chrono::steady_clock::now() > deadline) break;
                 }
 
-                // Move items (Sequential logic within worker)
                 perform_move_items(local_items, local_weights);
-                
-                // Update GLS weights
                 updateLocalWeights(local_weights, local_items, config);
 
                 double current_e = calculate_energy(local_items);
 
-                // Update Local Best
                 if (current_e < local_best_energy) {
                     local_best_energy = current_e;
                     improved_in_try = true;
                 }
 
-                // Check against Global Best
-                // Use double-checked locking to avoid mutex overhead
                 if (current_e < best_global_energy) {
                     #pragma omp critical
                     {
                         if (current_e < best_global_energy) {
                             best_global_energy = current_e;
-                            items = local_items; // Update Master State
+                            items = local_items;
                             weights = local_weights;
-                            std::cout << "   [Worker " << omp_get_thread_num() << "] New Best Energy: " << best_global_energy << std::endl;
+                            // std::cout << "   [Worker " << omp_get_thread_num() << "] New Best Energy: " << best_global_energy << std::endl;
                         }
                         if (best_global_energy <= 1e-4) {
                             solution_found = true;
@@ -396,17 +390,18 @@ bool SparrowSolver::separate(int kmax, int nmax, double time_limit_sec) {
 
                 if (solution_found) break;
 
-                // Stagnation counter logic
                 if (current_e >= local_best_energy) n++;
                 else n = 0;
             }
             
+            // Nếu hết giờ thì thoát luôn cả vòng lặp ngoài
+            if (std::chrono::steady_clock::now() > deadline) break;
             if (solution_found) break;
 
             k++;
             if (improved_in_try) k = 0;
         }
-    } // End Parallel
+    } 
 
     return (best_global_energy <= 1e-4);
 }
@@ -441,12 +436,17 @@ void SparrowSolver::scrambleItems() {
 }
 
 void SparrowSolver::explore() {
-    auto start = std::chrono::steady_clock::now();
+    // [SỬA ĐỔI] Thiết lập Deadline cho toàn bộ Phase Explore
+    auto start_time = std::chrono::steady_clock::now();
+    auto deadline = start_time + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(config.TLx));
     
-    if (!separate(config.Kx, config.Nx * 2, config.TLx)) {
+    // Initial check (truyền deadline vào)
+    if (!separate(config.Kx, config.Nx * 2, deadline)) {
+        if (std::chrono::steady_clock::now() > deadline) return; // Hết giờ thì dừng
+
         config.container_size *= 1.05;
         initializePlacement(); 
-        separate(config.Kx, config.Nx * 2, config.TLx);
+        separate(config.Kx, config.Nx * 2, deadline);
     }
 
     double best_size = config.container_size;
@@ -457,8 +457,8 @@ void SparrowSolver::explore() {
     double current_Rx = config.Rx; 
 
     while (iter < config.max_outer_loops) {
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
-        if (elapsed > config.TLx) break;
+        // [SỬA ĐỔI] Kiểm tra deadline ở vòng lặp ngoài
+        if (std::chrono::steady_clock::now() > deadline) break;
         
         if (current_Rx < 1e-5) {
              current_Rx = config.Rx; 
@@ -480,13 +480,22 @@ void SparrowSolver::explore() {
         for(auto& r : weights) std::fill(r.begin(), r.end(), 1.0);
 
         int effective_Nx = config.Nx + (fail_streak * 50);
-        bool feasible = separate(config.Kx, effective_Nx, config.TLx - elapsed);
+        
+        // [SỬA ĐỔI] Gọi separate với deadline chung của phase
+        bool feasible = separate(config.Kx, effective_Nx, deadline);
 
         if (feasible) {
             best_size = config.container_size;
             s_best = items;
             fail_streak = 0;
         } else {
+            // Kiểm tra xem fail do hết giờ hay do không tìm thấy
+            if (std::chrono::steady_clock::now() > deadline) {
+                items = s_prev_feasible; // Revert an toàn trước khi thoát
+                config.container_size = size_prev;
+                break;
+            }
+
             fail_streak++;
             items = s_prev_feasible;
             config.container_size = size_prev;
@@ -502,16 +511,23 @@ void SparrowSolver::explore() {
 }
 
 void SparrowSolver::compress(double ratio) {
-    auto start = std::chrono::steady_clock::now();
+    // [SỬA ĐỔI] Thiết lập Deadline cho toàn bộ Phase Compress
+    auto start_time = std::chrono::steady_clock::now();
+    auto deadline = start_time + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(config.TLc));
+
     std::vector<CompositeShape> s_star = items;
     double best_size = config.container_size;
     
     int loop_iter = 0;
     while (loop_iter < config.max_outer_loops) {
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
-        if (elapsed > config.TLc) break;
+        // Kiểm tra deadline
+        if (std::chrono::steady_clock::now() > deadline) break;
 
-        double progress = (double)elapsed / config.TLc;
+        // Tính progress dựa trên thời gian đã trôi qua thực tế
+        std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start_time;
+        double progress = elapsed.count() / config.TLc;
+        if (progress > 1.0) progress = 1.0;
+
         double r = config.Rs_c + (config.Re_c - config.Rs_c) * progress;
 
         items = s_star;
@@ -520,7 +536,8 @@ void SparrowSolver::compress(double ratio) {
 
         for(auto& row : weights) std::fill(row.begin(), row.end(), 1.0);
 
-        bool feasible = separate(config.Kc, config.Nc, config.TLc - elapsed);
+        // Gọi separate với deadline
+        bool feasible = separate(config.Kc, config.Nc, deadline);
 
         if (feasible) {
             s_star = items;
@@ -528,7 +545,12 @@ void SparrowSolver::compress(double ratio) {
              std::cout << "   Compress success -> " << best_size << std::endl;
         } else {
             config.container_size = old_size;
-             std::cout << "   Compress fail, revert." << std::endl;
+            // Nếu hết giờ thì break luôn, không in fail revert thừa
+            if (std::chrono::steady_clock::now() > deadline) {
+                 std::cout << "   Compress timeout." << std::endl;
+                 break;
+            }
+            std::cout << "   Compress fail, revert." << std::endl;
         }
         loop_iter++;
     }
@@ -544,7 +566,11 @@ void SparrowSolver::solve() {
     std::cout << ">>> Solver Started. Items: " << items.size() << std::endl;
     
     int attempts = 0;
-    while (!separate(config.Kx, config.Nx * 2, config.TLx) && attempts < 10) {
+    while (attempts < 10) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(config.TLx));
+        
+        if (separate(config.Kx, config.Nx * 2, deadline)) break;
+
         std::cout << "[Warn] Initial config infeasible. Expanding..." << std::endl;
         config.container_size *= 1.1;
         initializePlacement();

@@ -6,6 +6,7 @@
 #include <random>
 #include <iostream>
 #include <fstream>
+#include <chrono>
 #include "Geometry.h"
 
 // Cấu trúc lưu trữ cấu hình thuật toán (thêm tham số từ Table 1 trong paper)
@@ -139,7 +140,7 @@ public:
 
     // Algorithm 9: Hàm tách rời va chạm (Feasibility Solver)
     // Trả về true nếu tìm được lời giải khả thi (Energy ~ 0)
-    bool separate(int kmax, int nmax, double time_limit_sec);  
+    bool separate(int kmax, int nmax, std::chrono::steady_clock::time_point deadline);  
 
     // Algorithm 13: Co nhỏ thùng chứa (Scale Down)
     void compress(double ratio);
