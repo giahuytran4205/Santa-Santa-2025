@@ -1,15 +1,15 @@
 # Sparrow Configuration File
-container_size = 1.1
-n_samples = 256
+container_size = 1.4
+n_samples = 1024
 n_threads = -1
 Nc = 200
-Nx = 100
-Kc = 7
-Kx = 5
-TLx = 120
-TLc = 60
+Nx = 50
+Kc = 5
+Kx = 3
+TLx = 60
+TLc = 30
 Rx = 0.005
 Rs_c = 0.005
 Re_c = 0.0001
 max_restart=5
-max_outer_loops=50
+max_outer_loops=20
