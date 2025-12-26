@@ -1,245 +1,363 @@
-// Geometry.cpp
 #include "Geometry.h"
+#include <cmath>
+#include <algorithm>
 #include <limits>
+#include <iostream>
 #include <queue>
-#include <functional>  // Cho CellCompare
+#include <vector>
 
-// Helper: Tính diện tích đa giác (Shoelace formula) - Copy từ SVGExport để tự chứa
+// ==========================================
+// HELPER FUNCTIONS & MATH UTILS
+// ==========================================
+
 double getPolygonArea(const std::vector<Vec2>& points) {
     double area = 0.0;
-    for (size_t i = 0; i < points.size(); ++i) {
-        size_t j = (i + 1) % points.size();
-        area += points[i].x * points[j].y;
-        area -= points[j].x * points[i].y;
+    size_t n = points.size();
+    if (n < 3) return 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        area += (points[i].x * points[(i + 1) % n].y - points[(i + 1) % n].x * points[i].y);
     }
-    return std::abs(area) / 2.0;
+    return std::abs(area) * 0.5;
 }
 
-// Helpers cho poles
-double distToLine(Vec2 p, Vec2 a, Vec2 b) {  // Distance point to line segment
+// Tính khoảng cách từ điểm P đến đoạn thẳng AB
+// Trả về khoảng cách bình phương để tối ưu
+double distToSegmentSq(Vec2 p, Vec2 a, Vec2 b) {
     Vec2 ab = b - a;
-    double len2 = ab.dot(ab);
-    if (len2 == 0) return (p - a).length();
-    double t = std::max(0.0, std::min(1.0, (p - a).dot(ab) / len2));
-    Vec2 proj = a + ab * t;
-    return (p - proj).length();
+    double lenSq = ab.lengthSq();
+    if (lenSq < 1e-12) return p.distSq(a);
+    double t = std::max(0.0, std::min(1.0, (p - a).dot(ab) / lenSq));
+    return p.distSq(a + ab * t);
 }
 
-bool isPointInsidePolygon(Vec2 p, const std::vector<Vec2>& verts) {
-    int n = verts.size();
-    double sum = 0.0;
-    for (int i = 0; i < n; ++i) {
-        Vec2 v1 = verts[i] - p;
-        Vec2 v2 = verts[(i+1)%n] - p;
-        sum += std::atan2(v1.x * v2.y - v1.y * v2.x, v1.dot(v2));
+// Lấy điểm gần nhất trên đoạn thẳng AB tính từ P
+Vec2 getClosestPointOnSegment(Vec2 p, Vec2 a, Vec2 b) {
+    Vec2 ab = b - a;
+    double lenSq = ab.lengthSq();
+    if (lenSq < 1e-12) return a;
+    double t = std::max(0.0, std::min(1.0, (p - a).dot(ab) / lenSq));
+    return a + ab * t;
+}
+
+// ==========================================
+// CONVEX POLYGON
+// ==========================================
+
+ConvexPolygon::ConvexPolygon() : isDirty(true), diameter(0), convexHullArea(0) {}
+
+void ConvexPolygon::setVertices(const std::vector<Vec2>& verts) {
+    localVertices = verts;
+    isDirty = true;
+    precomputeMetrics();
+}
+
+void ConvexPolygon::setTransform(Vec2 pos, double angle) {
+    if (transform.pos != pos || transform.angle != angle) {
+        transform.pos = pos;
+        transform.angle = angle;
+        isDirty = true;
     }
-    return std::abs(sum) > PI;  // Winding >0 for inside
 }
-
-double signedDistToPolygon(Vec2 p, const std::vector<Vec2>& verts) {
-    double minDist = std::numeric_limits<double>::max();
-    int n = verts.size();
-    for (int i = 0; i < n; ++i) {
-        minDist = std::min(minDist, distToLine(p, verts[i], verts[(i+1)%n]));
-    }
-    bool inside = isPointInsidePolygon(p, verts);
-    return inside ? minDist : -minDist;
-}
-
-// Quadtree Cell
-struct Cell {
-    Vec2 center;
-    double halfSize;
-    double dist;  // signed dist of center
-    double potential() const { return dist + halfSize * std::sqrt(2.0); }  // max possible dist in cell
-};
-
-struct CellCompare {
-    bool operator()(const Cell& a, const Cell& b) { return a.potential() < b.potential(); }  // Max heap
-};
-
-// --- ConvexPolygon Implementation ---
-
-ConvexPolygon::ConvexPolygon() : isDirty(true) {}
-
-void ConvexPolygon::warmUp() const { updateCache(); }
 
 void ConvexPolygon::updateCache() const {
     if (!isDirty) return;
-
+    worldVertices.resize(localVertices.size());
+    
+    double c = std::cos(transform.angle);
+    double s = std::sin(transform.angle);
     double minX = std::numeric_limits<double>::max();
     double maxX = -std::numeric_limits<double>::max();
     double minY = std::numeric_limits<double>::max();
     double maxY = -std::numeric_limits<double>::max();
 
-    size_t count = localVertices.size();
-    
-    // 1. Transform Vertices & Compute AABB
-    for (size_t i = 0; i < count; ++i) {
-        Vec2 v = localVertices[i].rotate(transform.sin_a, transform.cos_a) + transform.pos;
-        worldVertices[i] = v;
-
-        if (v.x < minX) minX = v.x;
-        if (v.x > maxX) maxX = v.x;
-        if (v.y < minY) minY = v.y;
-        if (v.y > maxY) maxY = v.y;
+    for (size_t i = 0; i < localVertices.size(); ++i) {
+        double x = localVertices[i].x * c - localVertices[i].y * s + transform.pos.x;
+        double y = localVertices[i].x * s + localVertices[i].y * c + transform.pos.y;
+        worldVertices[i] = {x, y};
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
     }
-    worldAABB = {{minX, minY}, {maxX, maxY}};
-
-    // 2. Transform Normals
-    for (size_t i = 0; i < count; ++i) {
-        worldNormals[i] = localNormals[i].rotate(transform.sin_a, transform.cos_a);
-    }
-
+    worldAABB = { {minX, minY}, {maxX, maxY} };
     isDirty = false;
 }
 
-void ConvexPolygon::setVertices(const std::vector<Vec2>& verts) {
-    localVertices = verts;
-    size_t count = verts.size();
-    
-    worldVertices.resize(count);
-    worldNormals.resize(count);
-    localNormals.resize(count);
+void ConvexPolygon::warmUp() const { updateCache(); }
+const std::vector<Vec2>& ConvexPolygon::getVertices() const { updateCache(); return worldVertices; }
+const std::vector<Vec2>& ConvexPolygon::getNormals() const { return worldNormals; } 
+const AABB& ConvexPolygon::getAABB() const { updateCache(); return worldAABB; }
+const std::vector<Vec2>& ConvexPolygon::getLocalVertices() const { return localVertices; }
 
-    // Pre-compute Local Normals
-    for (size_t i = 0; i < count; ++i) {
-        Vec2 p1 = localVertices[i];
-        Vec2 p2 = localVertices[(i + 1) % count];
-        Vec2 edge = p2 - p1;
-        // Pháp tuyến (-y, x)
-        Vec2 normal = {-edge.y, edge.x};
-        double len = std::sqrt(normal.x*normal.x + normal.y*normal.y);
-        localNormals[i] = normal * (1.0 / len);
+// Ray Casting check point inside
+bool ConvexPolygon::contains(Vec2 p) const {
+    const auto& verts = getVertices();
+    bool inside = false;
+    size_t n = verts.size();
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        if (((verts[i].y > p.y) != (verts[j].y > p.y)) &&
+            (p.x < (verts[j].x - verts[i].x) * (p.y - verts[i].y) / (verts[j].y - verts[i].y) + verts[i].x)) {
+            inside = !inside;
+        }
     }
-    
-    isDirty = true;
+    return inside;
 }
 
-void ConvexPolygon::setTransform(Vec2 pos, double angle) {
-    transform.set(pos, angle);
-    isDirty = true; 
-}
-
-const std::vector<Vec2>& ConvexPolygon::getVertices() const {
-    updateCache();
-    return worldVertices;
-}
-
-const std::vector<Vec2>& ConvexPolygon::getNormals() const {
-    updateCache();
-    return worldNormals;
-}
-
-const AABB& ConvexPolygon::getAABB() const {
-    updateCache();
-    return worldAABB;
-}
-
-const std::vector<Vec2>& ConvexPolygon::getLocalVertices() const {
-    return localVertices;
-}
-
-void ConvexPolygon::precomputePolesAndMetrics(double precision_rel) {
+void ConvexPolygon::precomputeMetrics() {
     convexHullArea = getPolygonArea(localVertices);
     diameter = 0.0;
     for (size_t i = 0; i < localVertices.size(); ++i) {
         for (size_t j = i + 1; j < localVertices.size(); ++j) {
-            double d = (localVertices[i] - localVertices[j]).length();
-            diameter = std::max(diameter, d);
+            double d = localVertices[i].distSq(localVertices[j]);
+            if (d > diameter) diameter = d;
         }
     }
-    double precision = precision_rel * diameter;
+    diameter = std::sqrt(diameter);
+}
 
-    // Polylabel quadtree for multiple poles
-    poles.clear();
-    double minX = std::numeric_limits<double>::max(), maxX = -minX;
-    double minY = std::numeric_limits<double>::max(), maxY = -minY;
-    for (const auto& v : localVertices) {
-        minX = std::min(minX, v.x); maxX = std::max(maxX, v.x);
-        minY = std::min(minY, v.y); maxY = std::max(maxY, v.y);
+// ==========================================
+// COMPOSITE SHAPE
+// ==========================================
+
+void CompositeShape::addPart(const std::vector<Vec2>& verts) {
+    ConvexPolygon poly;
+    poly.setVertices(verts);
+    parts.push_back(poly);
+    convexHullArea += poly.convexHullArea; // Approximate
+    if (poly.diameter > diameter) diameter = poly.diameter; 
+}
+
+void CompositeShape::setTransform(Vec2 p, double a) {
+    if (pos != p || angle != a) {
+        pos = p;
+        angle = a;
+        double minX = std::numeric_limits<double>::max();
+        double maxX = -std::numeric_limits<double>::max();
+        double minY = std::numeric_limits<double>::max();
+        double maxY = -std::numeric_limits<double>::max();
+        for (auto& part : parts) {
+            part.setTransform(pos, angle);
+            const AABB& b = part.getAABB();
+            if (b.min.x < minX) minX = b.min.x;
+            if (b.max.x > maxX) maxX = b.max.x;
+            if (b.min.y < minY) minY = b.min.y;
+            if (b.max.y > maxY) maxY = b.max.y;
+        }
+        totalAABB = { {minX, minY}, {maxX, maxY} };
     }
-    double cx = (minX + maxX) / 2.0;
-    double cy = (minY + maxY) / 2.0;
-    double halfSize = std::max(maxX - minX, maxY - minY) / 2.0;
-    Cell initial = { {cx, cy}, halfSize, signedDistToPolygon({cx, cy}, localVertices) };
+}
 
-    std::priority_queue<Cell, std::vector<Cell>, CellCompare> pq;
-    pq.push(initial);
+void CompositeShape::warmUp() const { for (const auto& part : parts) part.warmUp(); }
 
-    double bestDist = 0.0;
-    while (!pq.empty()) {
-        Cell cell = pq.top(); pq.pop();
-        if (cell.dist < 0) continue;  // Outside
+bool CompositeShape::contains(Vec2 p) const {
+    if (!totalAABB.contains(p)) return false;
+    for (const auto& part : parts) {
+        if (part.getAABB().contains(p)) {
+            if (part.contains(p)) return true;
+        }
+    }
+    return false;
+}
 
-        if (cell.halfSize < precision) {
-            poles.push_back({cell.center, cell.dist});
-            bestDist = std::max(bestDist, cell.dist);
-            continue;
+// ==========================================
+// THUẬT TOÁN UNIFIED POLE OF INACCESSIBILITY
+// ==========================================
+
+// Cấu trúc Node cho Quadtree search (giống POINode của Rust)
+struct POINode {
+    Vec2 center;
+    double h; // Half-size of the cell (width/2)
+    double dist; // Fitness value (distance to boundary/poles)
+
+    // Max potential distance for any point in this cell
+    double getUpperBound() const {
+        return dist + h * 1.41421356; // dist + h * sqrt(2)
+    }
+
+    bool operator<(const POINode& other) const {
+        return dist < other.dist; // Max-heap based on distance
+    }
+};
+
+struct CircleData { double x, y, r; };
+
+// Kiểm tra xem điểm Q có bị "che" bởi phần nào khác của vật thể không
+// Dùng để loại bỏ các cạnh nội bộ (internal edges)
+bool isPointInternal(const CompositeShape& shape, Vec2 q, size_t ignorePartIdx) {
+    // Check điểm q có nằm TRONG bất kỳ part nào khác không (không tính biên)
+    // Dung sai nhỏ để tránh nhiễu số học
+    const double EPS = 1e-4; 
+    for (size_t i = 0; i < shape.parts.size(); ++i) {
+        if (i == ignorePartIdx) continue;
+        const auto& part = shape.parts[i];
+        
+        // Nếu part này chứa q, nghĩa là q nằm bên trong hợp của shape
+        // -> Cạnh sinh ra q là cạnh nội bộ.
+        // Dùng ray casting check
+        if (part.getAABB().contains(q) && part.contains(q)) {
+            // Check kỹ hơn khoảng cách biên để chắc chắn nó nằm sâu bên trong
+            // hoặc chồng lấn thực sự
+            return true;
+        }
+    }
+    return false;
+}
+
+// Tính khoảng cách từ P đến "Biên bao" (Unified Boundary) của CompositeShape
+// Logic: Khoảng cách ngắn nhất tới bất kỳ cạnh nào mà cạnh đó KHÔNG phải là cạnh nội bộ.
+double getDistToUnifiedBoundary(const CompositeShape& shape, Vec2 p) {
+    // 1. Kiểm tra P có nằm trong Shape không (bất kỳ phần nào)
+    bool inside = false;
+    for (const auto& part : shape.parts) {
+        if (part.getAABB().contains(p) && part.contains(p)) {
+            inside = true;
+            break;
+        }
+    }
+    // Nếu nằm ngoài -> trả về số âm (hoặc -1)
+    if (!inside) return -1.0;
+
+    double minD = std::numeric_limits<double>::max();
+
+    // 2. Tìm khoảng cách tới cạnh gần nhất
+    for (size_t i = 0; i < shape.parts.size(); ++i) {
+        const auto& part = shape.parts[i];
+        const auto& verts = part.getVertices();
+        size_t n = verts.size();
+
+        for (size_t k = 0; k < n; ++k) {
+            Vec2 v1 = verts[k];
+            Vec2 v2 = verts[(k + 1) % n];
+            
+            // Tìm điểm gần nhất Q trên đoạn thẳng v1-v2
+            Vec2 q = getClosestPointOnSegment(p, v1, v2);
+            
+            // QUAN TRỌNG: Kiểm tra Q có phải là điểm "nội bộ" (bị che bởi part khác) không?
+            // Nếu Q nằm trong một part khác -> Cạnh này là đường nối bên trong -> Bỏ qua
+            if (isPointInternal(shape, q, i)) {
+                continue; 
+            }
+
+            double dSq = p.distSq(q);
+            if (dSq < minD) minD = dSq;
+        }
+    }
+    
+    return std::sqrt(minD);
+}
+
+// Tìm Pole tiếp theo dựa trên Quadtree
+CircleData computePole(const CompositeShape& shape, const std::vector<CircleData>& existingPoles) {
+    const double precision = 1e-3; // Độ chính xác dừng
+    AABB rootBox = shape.totalAABB;
+    
+    // Hàm đánh giá Fitness cho điểm P
+    auto evaluate = [&](Vec2 p) -> double {
+        // Dist to unified boundary (Dương nếu trong, Âm nếu ngoài)
+        double dPoly = getDistToUnifiedBoundary(shape, p);
+        if (dPoly <= 0) return dPoly; // Nằm ngoài -> Invalid
+
+        // Dist to existing poles (signed distance)
+        // Chúng ta muốn điểm P nằm NGOÀI các pole đã có
+        // Dist = Khoảng cách tới tâm Pole - Bán kính Pole
+        double dPoles = std::numeric_limits<double>::max();
+        for (const auto& pole : existingPoles) {
+            // Signed distance function của hình tròn:
+            // d > 0: Nằm ngoài pole
+            // d < 0: Nằm trong pole (phạt)
+            double d = p.dist({pole.x, pole.y}) - pole.r;
+            if (d < dPoles) dPoles = d;
         }
 
-        if (cell.potential() <= bestDist) continue;  // Prune
+        // Fitness là min của (khoảng cách tới biên, khoảng cách tới các pole khác)
+        // Điều này ép hình tròn mới phải vừa nằm trong shape, vừa không đè lên pole cũ
+        return std::min(dPoly, dPoles);
+    };
 
-        // Subdivide
-        double h = cell.halfSize / 2.0;
-        for (double dx : {-h, h}) {
-            for (double dy : {-h, h}) {
-                Vec2 c = {cell.center.x + dx, cell.center.y + dy};
-                double d = signedDistToPolygon(c, localVertices);
-                if (d > bestDist) bestDist = d;
-                pq.push({c, h, d});
+    std::priority_queue<POINode> queue;
+    
+    // Init Root Node
+    double cellSize = std::max(rootBox.width(), rootBox.height()) * 0.5;
+    Vec2 center = rootBox.center();
+    queue.push({center, cellSize, evaluate(center)});
+
+    CircleData bestPole = {center.x, center.y, 0.0}; // Default bad pole
+
+    while (!queue.empty()) {
+        POINode node = queue.top();
+        queue.pop();
+
+        // Pruning: Nếu node này không thể chứa điểm tốt hơn best hiện tại
+        if (node.getUpperBound() <= bestPole.r) continue;
+
+        // Cập nhật Best
+        if (node.dist > bestPole.r) {
+            bestPole = {node.center.x, node.center.y, node.dist};
+        }
+
+        // Split
+        if (node.h > precision) {
+            double h = node.h * 0.5;
+            // 4 children centered at offsets
+            double offsets[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+            for (int i = 0; i < 4; ++i) {
+                Vec2 c = {node.center.x + offsets[i][0] * h, node.center.y + offsets[i][1] * h};
+                // Quick check: Nếu bbox con nằm hoàn toàn ngoài AABB shape -> Bỏ qua (Optimization)
+                // (Ở đây ta check đơn giản bằng evaluate tại tâm)
+                queue.push({c, h, evaluate(c)});
             }
         }
     }
 
-    // Filter to 8-16 highest
-    std::sort(poles.begin(), poles.end(), [](const Pole& a, const Pole& b) { return a.radius > b.radius; });
-    if (poles.size() > 16) poles.resize(16);
+    return bestPole;
 }
 
-// --- CompositeShape Implementation ---
+// --- MAIN FUNCTION: GENERATE SURROGATE CIRCLES ---
+// Logic: Iterative Pole of Inaccessibility
+void CompositeShape::generateSurrogateCircles(double quality_scale) {
+    circles.clear();
+    
+    // 1. Reset transform về local (0,0)
+    Vec2 oldPos = pos;
+    double oldAngle = angle;
+    setTransform({0, 0}, 0);
+    
+    std::vector<CircleData> poles;
+    
+    // Số lượng Pole mục tiêu (giống Rust config)
+    // quality_scale = 1.0 -> khoảng 16-32 poles là đẹp
+    int maxPoles = (int)(24 * quality_scale);
+    if (maxPoles < 4) maxPoles = 4;
 
-void CompositeShape::warmUp() const {
-    for(const auto& part : parts) part.warmUp();
-    // updateCache của CompositeShape (tính totalAABB) đã nằm trong setTransform, 
-    // nhưng để chắc chắn ta có thể gọi logic tính AABB ở đây nếu cần.
-}
+    // Diện tích mục tiêu phủ (Heuristic)
+    double targetArea = 0.0;
+    for(const auto& p : parts) targetArea += p.convexHullArea;
+    targetArea *= 0.95; // Phủ 95% diện tích
 
-void CompositeShape::addPart(const std::vector<Vec2>& verts) {
-    ConvexPolygon p;
-    p.setVertices(verts);
-    parts.push_back(p);
-}
+    double currentArea = 0.0;
 
-void CompositeShape::setTransform(Vec2 pos, double angle) {
-    this->pos = pos;
-    this->angle = angle;
-
-    double minX = std::numeric_limits<double>::max();
-    double maxX = -std::numeric_limits<double>::max();
-    double minY = std::numeric_limits<double>::max();
-    double maxY = -std::numeric_limits<double>::max();
-
-    for (auto& part : parts) {
-        part.setTransform(pos, angle);
+    for (int i = 0; i < maxPoles; ++i) {
+        // Tìm Pole tốt nhất
+        CircleData p = computePole(*this, poles);
         
-        const AABB& aabb = part.getAABB();
-        if (aabb.min.x < minX) minX = aabb.min.x;
-        if (aabb.max.x > maxX) maxX = aabb.max.x;
-        if (aabb.min.y < minY) minY = aabb.min.y;
-        if (aabb.max.y > maxY) maxY = aabb.max.y;
+        // Nếu bán kính quá nhỏ (vào khe hẹp quá mức) hoặc âm (không tìm thấy chỗ trống) -> Dừng
+        if (p.r < 1e-3) break;
+        
+        poles.push_back(p);
+        circles.add(p.x, p.y, p.r);
+        
+        currentArea += 3.14159 * p.r * p.r;
+        // Break sớm nếu đã phủ kín (tương đối)
+        if (currentArea > targetArea) break;
     }
-    totalAABB = {{minX, minY}, {maxX, maxY}};
-}
+    
+    // FALLBACK: Nếu shape quá dị, ít nhất có 1 circle ở tâm
+    if (circles.size() == 0) {
+        Vec2 c = totalAABB.center();
+        double r = std::min(totalAABB.width(), totalAABB.height()) * 0.25;
+        circles.add(c.x, c.y, r);
+    }
 
-void CompositeShape::precomputeAllPoles(double precision_rel) {
-    allPoles.clear();
-    diameter = 0.0;
-    convexHullArea = 0.0;
-    for (auto& part : parts) {
-        part.precomputePolesAndMetrics(precision_rel);
-        allPoles.insert(allPoles.end(), part.poles.begin(), part.poles.end());
-        diameter = std::max(diameter, part.diameter);
-        convexHullArea += part.convexHullArea;
-    }
+    // 2. Restore transform
+    setTransform(oldPos, oldAngle);
 }

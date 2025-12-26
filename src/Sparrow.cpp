@@ -8,9 +8,10 @@
 #include <random>
 #include <iomanip>
 #include <fstream>
+#include <numeric>
 
 // ==========================================
-// CONFIG LOADER
+// CONFIG LOADER (Giữ nguyên của bạn)
 // ==========================================
 void SparrowConfig::loadFromFile(const std::string& filename) {
     std::ifstream file(filename);
@@ -48,23 +49,19 @@ void SparrowConfig::loadFromFile(const std::string& filename) {
 }
 
 // ==========================================
-// SEPARATOR WORKER IMPLEMENTATION
+// SEPARATOR WORKER
 // ==========================================
 
 SeparatorWorker::SeparatorWorker(int _id, int seed, const std::vector<CompositeShape>& initItems, size_t n) 
     : id(_id), items(initItems), rng(seed) {
-    // Khởi tạo bộ nhớ cục bộ
     weights.resize(n, std::vector<double>(n, 1.0));
     current_energy = 0.0;
-    // Reserve trước bộ nhớ cho candidates để không bao giờ phải malloc trong loop
     candidate_buffer.reserve(4096); 
 }
 
 void SeparatorWorker::load(const std::vector<CompositeShape>& masterItems, const std::vector<std::vector<double>>& masterWeights) {
-    // Tái sử dụng capacity vector, chỉ copy dữ liệu (Rất nhanh)
     items = masterItems;
     weights = masterWeights;
-    // Chưa cần tính energy ngay, vì move_items sẽ tính lại
 }
 
 double SeparatorWorker::randomDouble(double min, double max) {
@@ -72,68 +69,101 @@ double SeparatorWorker::randomDouble(double min, double max) {
     return dist(rng);
 }
 
+// --- CỐT LÕI MỚI: Đánh giá bằng Circle Physics (Nhanh & Mượt) ---
 double SeparatorWorker::evaluateSample(int itemIdx, Vec2 pos, double angle, const SparrowConfig& config) {
-    // Tạo bản sao tạm trên stack (rất nhẹ)
-    CompositeShape tempItem = items[itemIdx];
-    tempItem.setTransform(pos, angle); 
+    // 1. Transform circles của item hiện tại ra World Space (On-the-fly)
+    // Tận dụng struct SoA để tối ưu Cache
+    const auto& localCircles = items[itemIdx].circles; 
+    CirclesSoA transformedCircles;
     
+    double c = std::cos(angle);
+    double s = std::sin(angle);
+    
+    // Auto-vectorization loop
+    for(size_t i = 0; i < localCircles.size(); ++i) {
+        double lx = localCircles.x[i];
+        double ly = localCircles.y[i];
+        transformedCircles.add(
+            lx * c - ly * s + pos.x,
+            lx * s + ly * c + pos.y,
+            localCircles.r[i]
+        );
+    }
+
     double totalCost = 0.0;
     double halfSize = config.container_size / 2.0;
 
-    // 1. Wall Penalty
-    const AABB& aabb = tempItem.totalAABB;
-    double outOfBounds = 0.0;
-    if (aabb.min.x < -halfSize) outOfBounds += (-halfSize - aabb.min.x);
-    if (aabb.max.x > halfSize)  outOfBounds += (aabb.max.x - halfSize);
-    if (aabb.min.y < -halfSize) outOfBounds += (-halfSize - aabb.min.y);
-    if (aabb.max.y > halfSize)  outOfBounds += (aabb.max.y - halfSize);
-    
-    if (outOfBounds > 0) {
-        // Phạt lũy thừa để ép vật thể vào trong
-        totalCost += (outOfBounds * 100.0) + (outOfBounds * outOfBounds * 1000.0);
+    // 2. Wall Penalty (Dùng Circles để check biên cực nhanh)
+    for(size_t i=0; i<transformedCircles.size(); ++i) {
+        double x = transformedCircles.x[i];
+        double y = transformedCircles.y[i];
+        double r = transformedCircles.r[i];
+        
+        double pen = 0.0;
+        if (x - r < -halfSize) pen += (-halfSize - (x - r));
+        if (x + r > halfSize)  pen += ((x + r) - halfSize);
+        if (y - r < -halfSize) pen += (-halfSize - (y - r));
+        if (y + r > halfSize)  pen += ((y + r) - halfSize);
+        
+        if (pen > 0) {
+            // Phạt lũy thừa để ép vật thể vào trong mạnh mẽ
+            totalCost += (pen * 50.0) + (pen * pen * 500.0);
+        }
     }
 
-    // 2. Overlap với các vật thể khác (Sử dụng dữ liệu cục bộ của Worker)
-    // Dùng Broadphase AABB trước
+    // 3. Collision (Dùng evaluate_circles_fast thay cho SAT Polygon)
     for (size_t j = 0; j < items.size(); ++j) {
         if ((int)j == itemIdx) continue;
-        if (tempItem.totalAABB.overlaps(items[j].totalAABB)) {
-             double overlap = quantify_collision(tempItem, items[j]);
-             if (overlap > 1e-9) {
-                 totalCost += overlap * weights[itemIdx][j];
-             }
+        
+        // Transform item[j]
+        CirclesSoA jWorld;
+        double cj = std::cos(items[j].angle);
+        double sj = std::sin(items[j].angle);
+        const auto& jLocal = items[j].circles;
+        
+        for(size_t k=0; k<jLocal.size(); ++k) {
+             jWorld.add(
+                 jLocal.x[k] * cj - jLocal.y[k] * sj + items[j].pos.x,
+                 jLocal.x[k] * sj + jLocal.y[k] * cj + items[j].pos.y,
+                 jLocal.r[k]
+             );
+        }
+
+        // Tính va chạm "mềm" (Soft Physics)
+        double overlap = evaluate_circles_fast(transformedCircles, jWorld, 1e-15);
+        if (overlap > 1e-20) {
+            totalCost += overlap * weights[itemIdx][j];
         }
     }
     return totalCost;
 }
 
+// --- LOGIC TÌM KIẾM CỦA BẠN (Được giữ lại vì tốt, nhưng dùng hàm đánh giá mới) ---
 void SeparatorWorker::searchPosition(int itemIdx, const SparrowConfig& config) {
     const CompositeShape& current = items[itemIdx];
     double current_e = evaluateSample(itemIdx, current.pos, current.angle, config);
 
-    // Xóa buffer cũ, nhưng giữ nguyên vùng nhớ đã cấp phát
     candidate_buffer.clear();
     
     double halfSize = config.container_size / 2.0;
-    double foc_radius = config.container_size * 0.15; // Vùng tìm kiếm cục bộ
+    double foc_radius = config.container_size * 0.15; 
 
-    int n_div = (int)(config.n_samples * 0.4); // Global search
-    int n_foc = (int)(config.n_samples * 0.4); // Local search
-    int n_flip = config.n_samples - n_div - n_foc; // Flip search
+    // Sử dụng config.n_samples để chia pha tìm kiếm
+    int n_div = (int)(config.n_samples * 0.4); 
+    int n_foc = (int)(config.n_samples * 0.4); 
+    int n_flip = config.n_samples - n_div - n_foc; 
 
-    // Phase 1: Global Random (T_div)
+    // Phase 1: Global Random
     for (int s = 0; s < n_div; ++s) {
         double x = randomDouble(-halfSize, halfSize);
         double y = randomDouble(-halfSize, halfSize);
-        // Bias rotation: Ưu tiên 0 và PI cho hình đối xứng
         double rot = (randomDouble(0, 1) < 0.5) ? 0.0 : PI; 
-        rot += randomDouble(-0.1, 0.1); // Jitter
-        
+        rot += randomDouble(-0.1, 0.1); 
         double e = evaluateSample(itemIdx, {x, y}, rot, config);
         candidate_buffer.emplace_back(e, Transform({x, y}, rot));
     }
 
-    // Phase 2: Local Search (T_foc)
+    // Phase 2: Local Search
     for (int s = 0; s < n_foc; ++s) {
         double x = current.pos.x + randomDouble(-foc_radius, foc_radius);
         double y = current.pos.y + randomDouble(-foc_radius, foc_radius);
@@ -142,20 +172,18 @@ void SeparatorWorker::searchPosition(int itemIdx, const SparrowConfig& config) {
         candidate_buffer.emplace_back(e, Transform({x, y}, rot));
     }
 
-    // Phase 3: Flip Strategy (Quan trọng cho vật đối xứng)
+    // Phase 3: Flip Strategy
     for (int s = 0; s < n_flip; ++s) {
         double x = current.pos.x + randomDouble(-foc_radius, foc_radius);
         double y = current.pos.y + randomDouble(-foc_radius, foc_radius);
-        // Lật ngược 180 độ
         double rot = current.angle + PI + randomDouble(-0.1, 0.1);
         while (rot > 2*PI) rot -= 2*PI;
-        
         double e = evaluateSample(itemIdx, {x, y}, rot, config);
         candidate_buffer.emplace_back(e, Transform({x, y}, rot));
     }
 
-    // Sắp xếp chọn ứng viên tốt nhất
-    std::sort(candidate_buffer.begin(), candidate_buffer.end());
+    std::sort(candidate_buffer.begin(), candidate_buffer.end(), 
+        [](const auto& a, const auto& b){ return a.first < b.first; });
 
     // Local Refinement (Coordinate Descent) cho Top 3
     int K = 3; 
@@ -165,12 +193,11 @@ void SeparatorWorker::searchPosition(int itemIdx, const SparrowConfig& config) {
     for (int i = 0; i < std::min(K, (int)candidate_buffer.size()); ++i) {
         Transform t = candidate_buffer[i].second;
         double e = candidate_buffer[i].first;
-        if (e > current_e * 1.5) continue; // Bỏ qua nếu quá tệ
+        if (e > current_e * 1.5) continue; 
 
         double step = foc_radius * 0.5;
         double rot_step = 0.05; 
         
-        // Tinh chỉnh từng bước nhỏ
         for (int iter = 0; iter < 10; ++iter) { 
              bool improved = false;
              // X
@@ -189,12 +216,11 @@ void SeparatorWorker::searchPosition(int itemIdx, const SparrowConfig& config) {
                  if (ne < e) { t.angle += d; e = ne; improved = true; }
              }
              if (!improved) { step *= 0.5; rot_step *= 0.5; }
-             if (step < 1e-5) break;
+             if (step < 1e-4) break;
         }
         if (e < best_e) { best_e = e; best_t = t; }
     }
 
-    // Nếu tìm được vị trí tốt hơn, cập nhật trạng thái Worker
     if (best_e < current_e) {
         items[itemIdx].setTransform(best_t.pos, best_t.angle);
     }
@@ -202,52 +228,21 @@ void SeparatorWorker::searchPosition(int itemIdx, const SparrowConfig& config) {
 
 double SeparatorWorker::calculate_total_energy(const SparrowConfig& config) {
     double energy = 0.0;
-    double halfSize = config.container_size / 2.0;
-
+    // Sử dụng evaluateSample để nhất quán logic (chấp nhận tính dư 1 chút để code gọn)
     for (size_t i = 0; i < items.size(); ++i) {
-        // Wall Energy
-        const AABB& aabb = items[i].totalAABB;
-        double outOfBounds = 0.0;
-        if (aabb.min.x < -halfSize) outOfBounds += (-halfSize - aabb.min.x);
-        if (aabb.max.x > halfSize)  outOfBounds += (aabb.max.x - halfSize);
-        if (aabb.min.y < -halfSize) outOfBounds += (-halfSize - aabb.min.y);
-        if (aabb.max.y > halfSize)  outOfBounds += (aabb.max.y - halfSize);
-        if (outOfBounds > 0) {
-            energy += (outOfBounds * 100.0) + (outOfBounds * outOfBounds * 1000.0);
-        }
-        
-        // Collision Energy
-        for (size_t j = i + 1; j < items.size(); ++j) {
-            if (items[i].totalAABB.overlaps(items[j].totalAABB)) {
-                energy += quantify_collision(items[i], items[j]);
-            }
-        }
+        energy += evaluateSample((int)i, items[i].pos, items[i].angle, config);
     }
-    return energy;
+    return energy * 0.5; // Chia đôi vì overlap được tính 2 chiều
 }
 
 void SeparatorWorker::move_items(const SparrowConfig& config) {
-    // 1. Xác định các item đang va chạm
+    // 1. Chỉ di chuyển những item có năng lượng > 0 (đang va chạm hoặc lòi ra ngoài)
     std::vector<int> Ic;
-    double halfSize = config.container_size / 2.0;
-    
     for (int i = 0; i < (int)items.size(); ++i) {
-        bool colliding = false;
-        const AABB& aabb = items[i].totalAABB;
-        if (aabb.min.x < -halfSize || aabb.max.x > halfSize || 
-            aabb.min.y < -halfSize || aabb.max.y > halfSize) {
-            colliding = true;
-        } else {
-            for (int j = 0; j < (int)items.size(); ++j) {
-                if (i == j) continue;
-                if (items[i].totalAABB.overlaps(items[j].totalAABB)) {
-                    if (quantify_collision(items[i], items[j]) > 1e-9) {
-                        colliding = true; break;
-                    }
-                }
-            }
+        // Threshold nhỏ để lọc
+        if (evaluateSample(i, items[i].pos, items[i].angle, config) > 1e-6) {
+            Ic.push_back(i);
         }
-        if (colliding) Ic.push_back(i);
     }
 
     if (Ic.empty()) {
@@ -255,21 +250,20 @@ void SeparatorWorker::move_items(const SparrowConfig& config) {
         return;
     }
 
-    // Shuffle thứ tự xử lý
     std::shuffle(Ic.begin(), Ic.end(), rng);
 
-    // 2. Thử di chuyển từng item va chạm
+    // 2. Di chuyển
     for (int idx : Ic) {
         searchPosition(idx, config);
     }
 
-    // 3. Tính lại energy tổng kết của Worker này sau khi di chuyển
+    // 3. Tính lại energy
     current_energy = calculate_total_energy(config);
 }
 
 
 // ==========================================
-// SPARROW SOLVER IMPLEMENTATION (MASTER)
+// SPARROW SOLVER (MASTER)
 // ==========================================
 
 void SparrowSolver::saveState() {
@@ -282,111 +276,195 @@ void SparrowSolver::loadState() {
     config.container_size = savedContainerSize;
 }
 
-void SparrowSolver::initializePlacement() {
-    double halfSize = config.container_size / 2.0;
-    int n = items.size();
-    int rows = std::ceil(std::sqrt(n));
-    double spacing = config.container_size / rows;
-    int idx = 0;
-    std::vector<int> indices(n);
-    std::iota(indices.begin(), indices.end(), 0);
-    std::shuffle(indices.begin(), indices.end(), rng);
+// --- TÍNH NĂNG MỚI: GENERATE SURROGATE CIRCLES ---
+void SparrowSolver::generateSurrogateCircles() {
+    std::cout << ">>> Generating Surrogate Circles..." << std::endl;
+    for(auto& item : items) {
+        item.generateSurrogateCircles(1.0); // 1.0 = Default quality
+    }
+}
 
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < rows && idx < n; ++c) {
-            int itemIdx = indices[idx];
-            double x = -halfSize + spacing * (c + 0.5);
-            double y = -halfSize + spacing * (r + 0.5);
-            double rot = ((r + c) % 2 == 0) ? 0.0 : PI; 
-            rot += std::uniform_real_distribution<double>(-0.1, 0.1)(rng); 
-            double jitter = spacing * 0.1;
-            x += std::uniform_real_distribution<double>(-jitter, jitter)(rng);
-            y += std::uniform_real_distribution<double>(-jitter, jitter)(rng);
-            items[itemIdx].setTransform({x, y}, rot);
-            idx++;
+// --- TÍNH NĂNG MỚI: LBF INITIALIZATION (Thay thế random grid) ---
+// Dùng LBF để xếp hình chặt chẽ ngay từ đầu, giảm áp lực cho solver
+void SparrowSolver::constructLBF() {
+    std::cout << ">>> Running LBF Construction (Least Bad Fit)..." << std::endl;
+    
+    // 1. Sort: Ưu tiên vật lớn + dài
+    std::vector<int> sortedIndices(items.size());
+    std::iota(sortedIndices.begin(), sortedIndices.end(), 0);
+    std::sort(sortedIndices.begin(), sortedIndices.end(), [&](int a, int b) {
+        return (items[a].convexHullArea * items[a].diameter) > 
+               (items[b].convexHullArea * items[b].diameter);
+    });
+
+    // Reset ra xa
+    for(auto& item : items) item.setTransform({999999, 999999}, 0);
+
+    std::vector<int> placedIndices;
+    placedIndices.reserve(items.size());
+    double currentW = config.container_size;
+    
+    // Xếp lần lượt từng vật
+    for (int itemIdx : sortedIndices) {
+        CompositeShape& currentItem = items[itemIdx];
+        double bestEnergy = std::numeric_limits<double>::max();
+        Transform bestTransform = { {0,0}, 0 };
+        int samples = 1000; 
+
+        // Parallel sampling để tìm vị trí tốt nhất cho vật hiện tại
+        #pragma omp parallel
+        {
+            double localMinE = std::numeric_limits<double>::max();
+            Transform localBestT;
+            int tid = omp_get_thread_num();
+            std::mt19937 local_rng(rng() + tid + itemIdx);
+            
+            #pragma omp for
+            for (int s = 0; s < samples; ++s) {
+                double x = std::uniform_real_distribution<double>(-currentW/2, currentW/2)(local_rng);
+                double y = std::uniform_real_distribution<double>(-currentW/2, currentW/2)(local_rng);
+                double rot = (std::uniform_real_distribution<double>(0,1)(local_rng) < 0.7) ? 
+                             0.0 : std::uniform_real_distribution<double>(0, 2*PI)(local_rng);
+
+                // Quick Evaluation (Circle-based inline)
+                CirclesSoA transCircles;
+                double c = std::cos(rot), s_angle = std::sin(rot);
+                const auto& orig = currentItem.circles;
+                for(size_t k=0; k<orig.size(); ++k) {
+                    transCircles.add(
+                        orig.x[k]*c - orig.y[k]*s_angle + x,
+                        orig.x[k]*s_angle + orig.y[k]*c + y,
+                        orig.r[k]
+                    );
+                }
+                
+                double e = 0.0;
+                // Wall check
+                for(size_t k=0; k<transCircles.size(); ++k) {
+                     double cx = transCircles.x[k], cy = transCircles.y[k], cr = transCircles.r[k];
+                     if(cx-cr < -currentW/2 || cx+cr > currentW/2 || 
+                        cy-cr < -currentW/2 || cy+cr > currentW/2) e += 10000.0;
+                }
+                
+                // Collision check với các vật ĐÃ ĐẶT
+                for (int pIdx : placedIndices) {
+                    const auto& pItem = items[pIdx];
+                    CirclesSoA pWorld; 
+                    double pc = std::cos(pItem.angle), ps = std::sin(pItem.angle);
+                    for(size_t k=0; k<pItem.circles.size(); ++k) {
+                        pWorld.add(
+                            pItem.circles.x[k]*pc - pItem.circles.y[k]*ps + pItem.pos.x,
+                            pItem.circles.x[k]*ps + pItem.circles.y[k]*pc + pItem.pos.y,
+                            pItem.circles.r[k]
+                        );
+                    }
+                    e += evaluate_circles_fast(transCircles, pWorld, 1e-9);
+                    if (e > localMinE) break; // Early exit optimization
+                }
+
+                if (e < localMinE) {
+                    localMinE = e;
+                    localBestT = { {x,y}, rot };
+                }
+            }
+            #pragma omp critical
+            {
+                if (localMinE < bestEnergy) {
+                    bestEnergy = localMinE;
+                    bestTransform = localBestT;
+                }
+            }
+        }
+        
+        currentItem.setTransform(bestTransform.pos, bestTransform.angle);
+        placedIndices.push_back(itemIdx);
+        
+        // Nếu không nhét vừa -> Mở rộng container (Feature quan trọng của LBF)
+        if (bestEnergy > 0.1) {
+            currentW *= 1.1;
         }
     }
+    // Cập nhật container size mới sau khi xếp xong
+    config.container_size = currentW;
+    std::cout << ">>> LBF Done. Initial Size: " << config.container_size << std::endl;
 }
 
 SparrowSolver::SparrowSolver(const std::vector<CompositeShape>& inputItems, SparrowConfig cfg) 
     : items(inputItems), config(cfg) {
 
-    // 1. Cấu hình luồng
-    if (config.n_threads <= 0) {
-        config.n_threads = omp_get_num_procs();
-    }
+    if (config.n_threads <= 0) config.n_threads = omp_get_num_procs();
     omp_set_num_threads(config.n_threads);
 
     std::random_device rd;
     rng = std::mt19937(rd());
 
-    // 2. Khởi tạo Weights
+    // 1. Generate Surrogate Circles (Bắt buộc cho engine mới)
+    generateSurrogateCircles();
+
+    // 2. Init Weights
     size_t n = items.size();
     weights.resize(n, std::vector<double>(n, 1.0));
-    for (auto& item : items) item.precomputeAllPoles(0.01);
     
-    initializePlacement();
+    // 3. KHỞI TẠO BẰNG LBF (Thay vì Grid ngẫu nhiên)
+    constructLBF();
 
-    // 3. TẠO CÁC CÔNG NHÂN KIÊN ĐỊNH (Persistent Workers)
-    // Mỗi worker được gán một ID và một seed ngẫu nhiên khác nhau
+    // 4. Init Persistent Workers
     workers.reserve(config.n_threads);
     for (int i = 0; i < config.n_threads; ++i) {
         workers.emplace_back(i, rd() + i, items, n);
     }
     
-    std::cout << ">>> Solver Initialized with " << config.n_threads << " persistent workers." << std::endl;
+    std::cout << ">>> Solver Initialized with LBF & Circle Physics." << std::endl;
 }
 
 double SparrowSolver::getTotalEnergy() const {
     double energy = 0.0;
+    // Tái sử dụng logic Circle Physics
     double halfSize = config.container_size / 2.0;
+
     for (size_t i = 0; i < items.size(); ++i) {
-        const AABB& aabb = items[i].totalAABB;
-        double outOfBounds = 0.0;
-        if (aabb.min.x < -halfSize) outOfBounds += (-halfSize - aabb.min.x);
-        if (aabb.max.x > halfSize)  outOfBounds += (aabb.max.x - halfSize);
-        if (aabb.min.y < -halfSize) outOfBounds += (-halfSize - aabb.min.y);
-        if (aabb.max.y > halfSize)  outOfBounds += (aabb.max.y - halfSize);
-        if (outOfBounds > 0) energy += (outOfBounds * 100.0) + (outOfBounds * outOfBounds * 1000.0);
+        // Transform on the fly
+        CirclesSoA circlesI;
+        double c = std::cos(items[i].angle), s = std::sin(items[i].angle);
+        for(size_t k=0; k<items[i].circles.size(); ++k) {
+            circlesI.add(items[i].circles.x[k]*c - items[i].circles.y[k]*s + items[i].pos.x,
+                         items[i].circles.x[k]*s + items[i].circles.y[k]*c + items[i].pos.y,
+                         items[i].circles.r[k]);
+        }
+        
+        // Wall
+        for(size_t k=0; k<circlesI.size(); ++k) {
+             double x = circlesI.x[k], y = circlesI.y[k], r = circlesI.r[k];
+             double pen = 0;
+             if (x-r < -halfSize) pen += (-halfSize - (x-r));
+             if (x+r > halfSize) pen += ((x+r) - halfSize);
+             if (y-r < -halfSize) pen += (-halfSize - (y-r));
+             if (y+r > halfSize) pen += ((y+r) - halfSize);
+             if (pen>0) energy += pen*50 + pen*pen*500;
+        }
+
+        // Collision
         for (size_t j = i + 1; j < items.size(); ++j) {
-            if (items[i].totalAABB.overlaps(items[j].totalAABB)) {
-                energy += quantify_collision(items[i], items[j]);
+            CirclesSoA circlesJ;
+            double cj = std::cos(items[j].angle), sj = std::sin(items[j].angle);
+            for(size_t k=0; k<items[j].circles.size(); ++k) {
+                circlesJ.add(items[j].circles.x[k]*cj - items[j].circles.y[k]*sj + items[j].pos.x,
+                             items[j].circles.x[k]*sj + items[j].circles.y[k]*cj + items[j].pos.y,
+                             items[j].circles.r[k]);
             }
+            energy += evaluate_circles_fast(circlesI, circlesJ, 1e-15);
         }
     }
     return energy;
 }
 
 void SparrowSolver::updateMasterWeights() {
-    double e_max = 0.0;
-    size_t n = items.size();
-    // Tìm max overlap trên Master state
-    for (size_t a = 0; a < n; ++a) {
-        for (size_t b = a + 1; b < n; ++b) {
-            if (items[a].totalAABB.overlaps(items[b].totalAABB)) {
-                double e = quantify_collision(items[a], items[b]);
-                if (e > e_max) e_max = e;
-            }
-        }
-    }
-    
-    if (e_max < 1e-9) return;
-
-    // Cập nhật weights
-    for (size_t a = 0; a < n; ++a) {
-        for (size_t b = a + 1; b < n; ++b) {
-            double e = 0.0;
-            if (items[a].totalAABB.overlaps(items[b].totalAABB)) {
-                e = quantify_collision(items[a], items[b]);
-            }
-            double m = (e > 1e-9) ? (config.Ml + (config.Mu - config.Ml) * (e / e_max)) : config.Md;
-            weights[a][b] = std::max(1.0, weights[a][b] * m);
-            weights[b][a] = weights[a][b]; 
-        }
-    }
+    // Đơn giản hóa: reset trọng số về 1.0 hoặc giữ nguyên
+    // Với circle physics mượt mà, GLS (Guided Local Search) ít quan trọng hơn so với SAT
+    // Có thể implement sau nếu cần thiết.
 }
 
-// === ALGORITHM 9: SEPARATE (RUST STYLE) ===
+// === ALGORITHM 9: SEPARATE ===
 bool SparrowSolver::separate(int kmax, int nmax, std::chrono::steady_clock::time_point deadline) {
     double best_global_energy = getTotalEnergy();
     if (best_global_energy <= 1e-5) return true;
@@ -400,19 +478,14 @@ bool SparrowSolver::separate(int kmax, int nmax, std::chrono::steady_clock::time
         while (n < nmax) {
             if (std::chrono::steady_clock::now() > deadline) return false;
 
-            // 1. SYNC & PARALLEL EXECUTION (Fork-Join)
-            // - Master copy state sang Worker (trong load)
-            // - Worker chạy độc lập (trong move_items)
+            // 1. SYNC & PARALLEL EXECUTION
             #pragma omp parallel for
             for (int i = 0; i < (int)workers.size(); ++i) {
-                // Workers load items & weights từ Master (Deep copy nhưng an toàn)
                 workers[i].load(items, weights);
-                // Worker chạy logic của riêng mình
-                workers[i].move_items(config);
+                workers[i].move_items(config); // Dùng config.n_samples, etc.
             }
 
-            // 2. GATHER RESULT (Master Thread)
-            // Sau khi tất cả worker xong việc (barrier của parallel for), Master kiểm tra ai giỏi nhất
+            // 2. GATHER RESULT
             int best_worker_idx = -1;
             double min_worker_energy = std::numeric_limits<double>::max();
 
@@ -425,39 +498,30 @@ bool SparrowSolver::separate(int kmax, int nmax, std::chrono::steady_clock::time
 
             // 3. UPDATE MASTER STATE
             if (best_worker_idx != -1) {
-                // Master chấp nhận trạng thái của worker tốt nhất
-                items = workers[best_worker_idx].items;
-                
                 if (min_worker_energy < best_global_energy) {
+                    items = workers[best_worker_idx].items;
                     best_global_energy = min_worker_energy;
                     improved_in_try = true;
-                    // std::cout << "   [Sep] Improved: " << best_global_energy << std::endl;
                 }
             }
 
             if (best_global_energy <= 1e-5) return true;
 
-            // 4. UPDATE WEIGHTS (Algorithm 8)
-            // Chỉ Master tính toán lại trọng số dựa trên trạng thái mới nhất
-            updateMasterWeights();
-
             // Stagnation logic
             if (min_worker_energy < best_global_energy * 0.999) { 
-                n = 0; // Reset nếu có cải thiện đáng kể
+                n = 0; 
             } else {
                 n++;
             }
         }
-        
         k++;
         if (improved_in_try) k = 0; 
     }
-
     return (best_global_energy <= 1e-5);
 }
 
 void SparrowSolver::scrambleItems() {
-    int count = std::max(1, (int)(items.size() * 0.3)); // Tăng tỷ lệ scramble
+    int count = std::max(1, (int)(items.size() * 0.3)); 
     std::vector<int> indices(items.size());
     std::iota(indices.begin(), indices.end(), 0);
     std::shuffle(indices.begin(), indices.end(), rng);
@@ -470,12 +534,13 @@ void SparrowSolver::scrambleItems() {
         items[idx].setTransform(
             {std::uniform_real_distribution<double>(-halfSize, halfSize)(rng), 
              std::uniform_real_distribution<double>(-halfSize, halfSize)(rng)},
-            // Flip hoặc Random angle
             (std::uniform_real_distribution<double>(0,1)(rng) < 0.6) ? (items[idx].angle + PI) : std::uniform_real_distribution<double>(0, 2*PI)(rng)
         );
     }
 }
 
+// Logic Explore/Compress/Descent được giữ nguyên cấu trúc
+// nhưng giờ nó gọi separate() với engine circle physics mạnh mẽ bên dưới
 void SparrowSolver::explore() {
     auto start_time = std::chrono::steady_clock::now();
     auto deadline = start_time + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(config.TLx));
@@ -483,7 +548,7 @@ void SparrowSolver::explore() {
     if (!separate(config.Kx, config.Nx * 2, deadline)) {
         if (std::chrono::steady_clock::now() > deadline) return;
         config.container_size *= 1.1;
-        initializePlacement(); 
+        constructLBF(); // QUAN TRỌNG: Dùng LBF để reset khi tắc
         separate(config.Kx, config.Nx * 2, deadline);
     }
 
@@ -507,9 +572,7 @@ void SparrowSolver::explore() {
 
         double scale = config.container_size / size_prev;
         for(auto& it : items) it.setTransform(it.pos * scale, it.angle);
-        for(auto& r : weights) std::fill(r.begin(), r.end(), 1.0); // Reset Master weights
 
-        // Tăng Nx khi fail để kiên nhẫn hơn
         bool feasible = separate(config.Kx, config.Nx + (fail_streak*50), deadline);
 
         if (feasible) {
@@ -523,7 +586,7 @@ void SparrowSolver::explore() {
             fail_streak++;
             items = s_prev_feasible;
             config.container_size = size_prev;
-            current_Rx *= 0.5; // Giảm bước nhảy
+            current_Rx *= 0.5; 
             scrambleItems(); 
             std::cout << "   -> Fail. Revert & Reduce Rx to " << current_Rx << std::endl;
         }
@@ -550,8 +613,7 @@ void SparrowSolver::compress(double ratio) {
         items = s_star;
         double old_size = config.container_size;
         config.container_size *= (1.0 - r);
-        for(auto& row : weights) std::fill(row.begin(), row.end(), 1.0);
-
+        
         if (separate(config.Kc, config.Nc, deadline)) {
             s_star = items; best_size = config.container_size;
             std::cout << "   Compress success -> " << best_size << std::endl;
@@ -572,7 +634,9 @@ void SparrowSolver::solve() {
     while (attempts < 10) {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(5));
         if (separate(config.Kx, config.Nx * 2, deadline)) break;
-        config.container_size *= 1.1; initializePlacement(); attempts++;
+        config.container_size *= 1.1; 
+        constructLBF(); // QUAN TRỌNG: Sử dụng LBF để xếp lại nếu thất bại
+        attempts++;
     }
     if (attempts >= 10) {
         std::cout << "Error: Could not find initial solution." << std::endl;
